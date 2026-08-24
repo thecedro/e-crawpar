@@ -1,0 +1,23 @@
+name: Mutation
+
+# Layer 6 — mutation testing with gremlins.
+# Slow by nature, so it runs weekly and on demand instead of on every push.
+# Camada 6 — testes de mutação com gremlins. Naturalmente lenta, roda
+# semanalmente e sob demanda em vez de a cada push.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC / segundas-feiras 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Run gremlins against the rule-dense packages
+        run: make test-mutation

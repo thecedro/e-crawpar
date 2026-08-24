@@ -1,14 +1,32 @@
 name: CI
 
-# Every PR and push to main: format check, vet, lint and tests.
-# Todo PR e push na main: checagem de formatação, vet, lint e testes.
+# Layered test strategy / estratégia de testes em camadas:
+#   - lint ............ every PR (fast feedback)
+#   - unit ............ every PR — layer 1, with coverage gate on internal/core
+#   - integration ..... every PR — layer 2 under the race detector
+#   - contract ........ every PR AND merge-blocking — layer 3 is the safety
+#                       net for "never reads the body, never mutates flags"
+#   - bdd ............. every PR — executable Portuguese specifications
+#   - e2e ............. every PR — full pipeline vs in-memory IMAP server
+#   mutation .......... weekly + manual (see mutation.yml)
+#
+# Estratégia de testes em camadas:
+#   - lint ............ todo PR (feedback rápido)
+#   - unit ............ todo PR — camada 1, com meta de cobertura em internal/core
+#   - integration ..... todo PR — camada 2 sob o detector de races
+#   - contract ........ todo PR E bloqueia merge — camada 3 é a rede de
+#                       segurança de "nunca lê o corpo, nunca altera flags"
+#   - bdd ............. todo PR — especificações executáveis em português
+#   - e2e ............. todo PR — pipeline completo contra servidor IMAP em memória
+#   mutation .......... semanal + manual (ver mutation.yml)
+
 on:
   pull_request:
   push:
     branches: [main]
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,10 +49,70 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: Unit tests
-        run: go test -race -timeout 120s -coverprofile=coverage.txt ./...
-
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           args: --new-from-rev HEAD~1
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Unit tests (layer 1) with core-coverage gate
+        run: make test-unit
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: coverage.out
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Integration tests (layer 2, -race)
+        run: make test-integration
+
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # MERGE-BLOCKING: this job guards the read-only/ENVELOPE-only promise.
+      # BLOQUEIA MERGE: este trabalho protege a promessa somente-leitura/apenas-ENVELOPE.
+      - name: Contract tests (layer 3)
+        run: make test-contract
+
+  bdd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: BDD scenarios (layer 5)
+        run: make test-bdd
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: End-to-end tests (layer 4, tag e2e)
+        run: make test-e2e
