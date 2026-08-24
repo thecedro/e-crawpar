@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -35,15 +36,15 @@ import (
 // Config holds every runtime setting loaded from the environment.
 // Config carrega todas as configurações de execução do ambiente.
 type Config struct {
-	Host        string        // IMAP server hostname (IMAP_HOST)
-	Port        string        // IMAP TLS port (default 993)
-	User        string        // account login (IMAP_USER)
-	Password    string        // app password (IMAP_APP_PASSWORD)
-	Mailbox     string        // mailbox to scan (IMAP_MAILBOX, default INBOX)
-	Since       *time.Time    // optional lower bound for search (IMAP_SINCE, RFC3339)
-	Workers     int           // classification worker pool size (WORKERS)
-	BatchSize   int           // messages per ENVELOPE fetch batch (BATCH_SIZE)
-	Ignore      map[string]bool // normalized domains to skip (built-in + IGNORE_DOMAINS)
+	Host      string          // IMAP server hostname (IMAP_HOST)
+	Port      string          // IMAP TLS port (default 993)
+	User      string          // account login (IMAP_USER)
+	Password  string          // app password (IMAP_APP_PASSWORD)
+	Mailbox   string          // mailbox to scan (IMAP_MAILBOX, default INBOX)
+	Since     *time.Time      // optional lower bound for search (IMAP_SINCE, RFC3339)
+	Workers   int             // classification worker pool size (WORKERS)
+	BatchSize int             // messages per ENVELOPE fetch batch (BATCH_SIZE)
+	Ignore    map[string]bool // normalized domains to skip (built-in + IGNORE_DOMAINS)
 }
 
 // loadConfig reads and validates all environment variables.
@@ -301,6 +302,124 @@ func collectJobs(cfg *Config, jobs chan<- job) error {
 }
 
 // ============================================================================
+// PIPELINE STAGE 2 — WORKER POOL / ETAPA 2 DO PIPELINE — POOL DE WORKERS
+// N goroutines consume jobs from a shared channel, classify the subject,
+// normalize the sender domain, apply the noise filter and emit results into
+// a single channel. The collector (stage 3) is the only writer of the
+// aggregate state, so no mutex is needed.
+//
+// N goroutines consomem jobs de um canal compartilhado, classificam o
+// assunto, normalizam o domínio do remetente, aplicam o filtro de ruído e
+// emitem resultados num único canal. A coletora (etapa 3) é a única
+// escritora do estado agregado, portanto nenhum mutex é necessário.
+// ============================================================================
+
+// result is a fully processed job, ready for aggregation.
+// result é um job totalmente processado, pronto para agregação.
+type result struct {
+	domain   string // normalized base domain ("amazon.com")
+	sender   string // original distinct address ("no-reply@amazon.com")
+	category string // matched category name ("verification")
+	subject  string // decoded subject, kept as report sample candidate
+	date     time.Time
+}
+
+// classify returns the first category matching the subject, or "" when none
+// does. Categories are evaluated in priority order (security first), so a
+// subject that matches two patterns keeps its strongest signal.
+//
+// classify retorna a primeira categoria que casa com o assunto, ou "" se
+// nenhuma casar. As categorias são avaliadas em ordem de prioridade
+// (segurança primeiro), então um assunto que case com dois padrões mantém
+// seu sinal mais forte.
+func classify(subject string, cats []Category) string {
+	for _, c := range cats {
+		for _, re := range c.Patterns {
+			if re.MatchString(subject) {
+				return c.Name
+			}
+		}
+	}
+	return ""
+}
+
+// normalizeDomain reduces a mail host to its base service domain:
+// "mail.booking.com" -> "booking.com" only while the leftmost label is a
+// known transactional prefix; unknown subdomains are preserved because we
+// never strip blindly below two labels ("foo.co.uk" stays "foo.co.uk").
+//
+// normalizeDomain reduz um host de e-mail ao domínio base do serviço:
+// "mail.booking.com" -> "booking.com" apenas enquanto o label mais à esquerda
+// for um prefixo transacional conhecido; subdomínios desconhecidos são
+// preservados porque nunca removemos às cegas abaixo de dois labels
+// ("foo.co.uk" continua "foo.co.uk").
+func normalizeDomain(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	labels := strings.Split(host, ".")
+	for len(labels) > 2 && transactionalPrefixes[labels[0]] {
+		labels = labels[1:]
+	}
+	return strings.Join(labels, ".")
+}
+
+// worker consumes jobs until the jobs channel closes. Jobs whose subject
+// matches nothing or whose domain is ignored produce no result — silence is
+// the noise filter at work.
+//
+// worker consome jobs até o canal fechar. Jobs cujo assunto não casa com
+// nada ou cujo domínio está na ignore-list não geram resultado — o silêncio
+// é o filtro de ruído em ação.
+func worker(jobs <-chan job, results chan<- result, cats []Category, ignore map[string]bool) {
+	for j := range jobs {
+		category := classify(j.subject, cats)
+		if category == "" {
+			continue // not an account-evidence email / não evidencia cadastro
+		}
+		domain := normalizeDomain(j.host)
+		if ignore[domain] {
+			continue // configured noise / ruído configurado
+		}
+		results <- result{
+			domain:   domain,
+			sender:   j.from,
+			category: category,
+			subject:  j.subject,
+			date:     j.date,
+		}
+	}
+}
+
+// runWorkerPool spawns cfg.Workers workers and wires the pipeline so that
+// closing jobs automatically drains and closes results. It blocks until all
+// work is done.
+//
+// runWorkerPool cria cfg.Workers workers e conecta o pipeline de modo que
+// fechar jobs drene e feche results automaticamente. Bloqueia até todo o
+// trabalho terminar.
+func runWorkerPool(cfg *Config, cats []Category, jobs <-chan job) <-chan result {
+	results := make(chan result)
+
+	var wg sync.WaitGroup
+	wg.Add(cfg.Workers)
+	for i := 0; i < cfg.Workers; i++ {
+		go func() {
+			defer wg.Done()
+			worker(jobs, results, cats, cfg.Ignore)
+		}()
+	}
+
+	// Single closer goroutine: results stays open until every worker exits,
+	// giving the collector a clean termination signal without mutexes.
+	// Goroutine única que fecha: results fica aberto até todos os workers
+	// terminarem, dando à coletora sinal limpo de término sem mutexes.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	return results
+}
+
+// ============================================================================
 // CLASSIFICATION PATTERNS / PADRÕES DE CLASSIFICAÇÃO
 // Subject regexes (case-insensitive) in priority order: the first category
 // that matches a subject wins. Security has top priority.
@@ -311,9 +430,9 @@ func collectJobs(cfg *Config, jobs chan<- job) error {
 // Category is one class of "account evidence" email.
 // Category é uma classe de e-mail que evidencia cadastro em um serviço.
 type Category struct {
-	Name     string            // stable identifier used in reports
-	Priority int               // lower = evaluated first
-	Patterns []*regexp.Regexp  // compiled case-insensitive patterns
+	Name     string           // stable identifier used in reports
+	Priority int              // lower = evaluated first
+	Patterns []*regexp.Regexp // compiled case-insensitive patterns
 }
 
 // categorySpecs maps category names to their PT-BR/EN patterns.
@@ -420,14 +539,18 @@ func main() {
 		}
 	}()
 
-	// Temporary drain; replaced by the worker pool in the next commit.
-	// Dreno temporário; substituído pelo pool de workers no próximo commit.
+	// Stages 2: worker pool classifies/normalizes/filters concurrently.
+	// Etapa 2: pool de workers classifica/normaliza/filtra em paralelo.
+	results := runWorkerPool(cfg, categories, jobs)
+
+	// Temporary drain; replaced by the collector in the next commit.
+	// Dreno temporário; substituído pela coletora no próximo commit.
 	count := 0
-	for j := range jobs {
+	for r := range results {
 		count++
-		if count <= 3 {
-			fmt.Printf("sample: date=%s from=%s subject=%.60q\n",
-				j.date.Format("2006-01-02"), j.from, j.subject)
+		if count <= 5 {
+			fmt.Printf("sample: date=%s domain=%s cat=%s from=%s subject=%.50q\n",
+				r.date.Format("2006-01-02"), r.domain, r.category, r.sender, r.subject)
 		}
 	}
 
@@ -435,7 +558,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "collect error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("collected %d headers (workers=%d batch=%d categories=%d ignored=%d)\n",
+	fmt.Printf("matched %d emails (workers=%d batch=%d categories=%d ignored=%d)\n",
 		count, cfg.Workers, cfg.BatchSize, len(categories), len(cfg.Ignore))
 }
 
@@ -476,4 +599,3 @@ var defaultIgnoreDomains = []string{
 	"nubank.com.br", "itau.com.br", "bradesco.com.br", "bb.com.br",
 	"santander.com.br", "caixa.gov.br",
 }
-
