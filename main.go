@@ -9,6 +9,8 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"mime"
@@ -19,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -515,10 +518,189 @@ func buildCategories() []Category {
 }
 
 // ============================================================================
-// ENTRY POINT / PONTO DE ENTRADA
+// PIPELINE STAGE 3 — COLLECTOR / ETAPA 3 DO PIPELINE — COLETORA
+// A single goroutine owns the aggregate map, so workers never touch shared
+// state and the code needs no mutex at all.
+//
+// Uma única goroutine é dona do mapa agregado; assim os workers nunca
+// tocaram em estado compartilhado e o código dispensa qualquer mutex.
 // ============================================================================
 
+// domainStat is one row of the final report: the "birth certificate" of an
+// account at a service plus everything observed about it.
+//
+// domainStat é uma linha do relatório final: a "certidão de nascimento" de
+// uma conta num serviço junto de tudo que foi observado sobre ela.
+type domainStat struct {
+	Domain          string   `json:"domain"`
+	FirstSeen       string   `json:"first_seen,omitempty"` // YYYY-MM-DD or absent when unknown
+	Categories      []string `json:"categories"`
+	Occurrences     int      `json:"occurrences"`
+	SampleSubject   string   `json:"sample_subject"` // prefers verification/welcome samples
+	DistinctSenders int      `json:"distinct_senders"`
+	MultiSender     bool     `json:"multiple_senders_alert"`
+}
+
+// agg is the mutable per-domain accumulator used while streaming results.
+// agg é o acumulador mutável por domínio usado durante o streaming.
+type agg struct {
+	first      time.Time
+	hasDate    bool
+	cats       map[string]bool
+	count      int
+	sample     string
+	sampleRank int // lower = better sample candidate
+	senders    map[string]bool
+}
+
+// categoryRank drives both evaluation order and report display order.
+// categoryRank dirige tanto a ordem de avaliação quanto a de exibição.
+var categoryRank = func() map[string]int {
+	m := make(map[string]int, len(categorySpecs))
+	for _, s := range categorySpecs {
+		m[s.Name] = s.Priority
+	}
+	return m
+}()
+
+// collect consumes every result from the (already concurrent) pipeline and
+// returns report rows sorted by first-seen date ascending — unknown dates go
+// last, keeping the timeline meaningful.
+//
+// collect consome todos os resultados do pipeline (já concorrente) e retorna
+// as linhas do relatório ordenadas por data da primeira ocorrência crescente
+// — datas desconhecidas vão para o fim, preservando a linha do tempo.
+func collect(results <-chan result) []domainStat {
+	aggs := make(map[string]*agg)
+
+	for r := range results {
+		a := aggs[r.domain]
+		if a == nil {
+			a = &agg{
+				cats:       make(map[string]bool),
+				senders:    make(map[string]bool),
+				sampleRank: 1 << 30,
+			}
+			aggs[r.domain] = a
+		}
+
+		a.count++
+		a.cats[r.category] = true
+		a.senders[r.sender] = true
+
+		// Track the earliest envelope Date: the account's "birthday".
+		// Guarda o menor Date do envelope: o "aniversário" da conta.
+		if !r.date.IsZero() && (!a.hasDate || r.date.Before(a.first)) {
+			a.first, a.hasDate = r.date, true
+		}
+
+		// Prefer a subject that screams "account creation": verification
+		// beats welcome beats anything else already stored.
+		// Prefere um assunto que grite "criação de conta": verificação vence
+		// boas-vindas que vence qualquer outro já armazenado.
+		if rank, ok := sampleRank(r.category); ok && rank < a.sampleRank {
+			a.sample, a.sampleRank = r.subject, rank
+		} else if a.sample == "" {
+			a.sample = r.subject
+		}
+	}
+
+	// Materialize rows.
+	// Materializa as linhas.
+	stats := make([]domainStat, 0, len(aggs))
+	for domain, a := range aggs {
+		cats := make([]string, 0, len(a.cats))
+		for c := range a.cats {
+			cats = append(cats, c)
+		}
+		// Categories shown in fixed priority order for stable reports.
+		// Categorias em ordem fixa de prioridade para relatórios estáveis.
+		sort.Slice(cats, func(i, j int) bool {
+			return categoryRank[cats[i]] < categoryRank[cats[j]]
+		})
+
+		row := domainStat{
+			Domain:          domain,
+			Categories:      cats,
+			Occurrences:     a.count,
+			SampleSubject:   a.sample,
+			DistinctSenders: len(a.senders),
+			MultiSender:     len(a.senders) > 1,
+		}
+		if a.hasDate {
+			row.FirstSeen = a.first.Format("2006-01-02")
+		}
+		stats = append(stats, row)
+	}
+
+	sort.Slice(stats, func(i, j int) bool {
+		a, b := stats[i], stats[j]
+		if (a.FirstSeen != "") != (b.FirstSeen != "") {
+			return a.FirstSeen != "" // dated rows first / linhas datadas primeiro
+		}
+		return a.FirstSeen < b.FirstSeen
+	})
+	return stats
+}
+
+// sampleRank maps categories to sample desirability: verification (2) then
+// welcome (3); other categories are not eligible as curated samples but the
+// caller still falls back to the first seen subject.
+//
+// sampleRank mapeia categorias para a preferência de amostra: verificação (2)
+// depois boas-vindas (3); outras categorias não são amostras curadas, mas o
+// chamador ainda usa o primeiro assunto visto como fallback.
+func sampleRank(category string) (int, bool) {
+	switch category {
+	case "verification":
+		return 2, true
+	case "welcome":
+		return 3, true
+	default:
+		return 0, false
+	}
+}
+
+// ============================================================================
+// PIPELINE STAGE 4 — REPORT / ETAPA 4 DO PIPELINE — RELATÓRIO
+// Human-readable table on stdout by default; pretty JSON with -json.
+// Tabela legível no stdout por padrão; JSON formatado com -json.
+// ============================================================================
+
+// renderText prints the aligned report table plus multi-sender alerts.
+// renderText imprime a tabela alinhada do relatório com alertas de múltiplos
+// remetentes.
+func renderText(w io.Writer, stats []domainStat) {
+	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "FIRST SEEN\tDOMAIN\tOCCUR\tCATEGORIES\tSENDERS\t")
+	for _, s := range stats {
+		first := s.FirstSeen
+		if first == "" {
+			first = "?"
+		}
+		line := fmt.Sprintf("%s\t%s\t%d\t%s\t%d\t",
+			first, s.Domain, s.Occurrences,
+			strings.Join(s.Categories, ", "), s.DistinctSenders)
+		if s.MultiSender {
+			line += "  << MULTIPLE SENDERS"
+		}
+		fmt.Fprintln(tw, line)
+	}
+	tw.Flush()
+
+	// Sample subjects come after the table so long lines never break it.
+	// Assuntos exemplo vêm após a tabela para não quebrá-la.
+	fmt.Fprintln(w, "\nSample subjects:")
+	for _, s := range stats {
+		fmt.Fprintf(w, "  %s\n    %q\n", s.Domain, s.SampleSubject)
+	}
+	fmt.Fprintf(w, "\n%d unique domains found.\n", len(stats))
+}
+
 func main() {
+	jsonOut := flag.Bool("json", false, "also print the report as JSON")
+	flag.Parse()
+
 	// Stage 0: load configuration (env vars only, never hardcoded).
 	// Etapa 0: carrega a configuração (só env vars, nunca hardcoded).
 	cfg, err := loadConfig()
@@ -539,27 +721,32 @@ func main() {
 		}
 	}()
 
-	// Stages 2: worker pool classifies/normalizes/filters concurrently.
+	// Stage 2: worker pool classifies/normalizes/filters concurrently.
 	// Etapa 2: pool de workers classifica/normaliza/filtra em paralelo.
 	results := runWorkerPool(cfg, categories, jobs)
 
-	// Temporary drain; replaced by the collector in the next commit.
-	// Dreno temporário; substituído pela coletora no próximo commit.
-	count := 0
-	for r := range results {
-		count++
-		if count <= 5 {
-			fmt.Printf("sample: date=%s domain=%s cat=%s from=%s subject=%.50q\n",
-				r.date.Format("2006-01-02"), r.domain, r.category, r.sender, r.subject)
-		}
-	}
+	// Stage 3+4: single collector aggregates, then the report renders.
+	// Etapas 3+4: coletora única agrega, depois o relatório é impresso.
+	stats := collect(results)
 
+	// Collection errors only surface after the drain: any successfully
+	// fetched batches were already processed, so we still show them.
+	// Erros de coleta aparecem só após o dreno: lotes já buscados foram
+	// processados, então ainda são exibidos.
 	if err := <-errCh; err != nil {
 		fmt.Fprintf(os.Stderr, "collect error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("matched %d emails (workers=%d batch=%d categories=%d ignored=%d)\n",
-		count, cfg.Workers, cfg.BatchSize, len(categories), len(cfg.Ignore))
+
+	renderText(os.Stdout, stats)
+	if *jsonOut {
+		out, err := json.MarshalIndent(stats, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "json error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+	}
 }
 
 // ============================================================================

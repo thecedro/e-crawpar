@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
@@ -102,5 +104,60 @@ func TestWorkerFiltersNoise(t *testing.T) {
 	case extra := <-results:
 		t.Fatalf("expected no second result, got %+v", extra)
 	default: // channel drained, as expected / canal drenado, como esperado
+	}
+}
+
+// TestCollectAggregationAndOrdering covers the collector: earliest-date
+// tracking, sample preference (verification > welcome > first seen),
+// distinct-sender counting and first-seen ordering with unknown dates last.
+//
+// TestCollectAggregationAndOrdering cobre a coletora: menor data, preferência
+// de amostra (verificação > boas-vindas > primeira vista), contagem de
+// remetentes distintos e ordenação por primeira ocorrência com datas
+// desconhecidas por último.
+func TestCollectAggregationAndOrdering(t *testing.T) {
+	d := func(y int, m time.Month, day int) time.Time {
+		return time.Date(y, m, day, 0, 0, 0, 0, time.UTC)
+	}
+	results := make(chan result, 8)
+	results <- result{domain: "svc.io", sender: "no-reply@svc.io", category: "welcome",
+		subject: "Welcome to svc", date: d(2020, 5, 10)}
+	results <- result{domain: "svc.io", sender: "billing@svc.io", category: "receipt",
+		subject: "Your invoice", date: d(2021, 1, 1)}
+	results <- result{domain: "svc.io", sender: "verify@svc.io", category: "verification",
+		subject: "Verify your email", date: d(2020, 5, 9)} // earlier than welcome!
+	results <- result{domain: "old.example", sender: "a@old.example", category: "policy",
+		subject: "Terms updated"} // zero date -> must sort last
+	close(results)
+
+	stats := collect(results)
+	if len(stats) != 2 {
+		t.Fatalf("want 2 domains, got %d: %+v", len(stats), stats)
+	}
+
+	first, second := stats[0], stats[1]
+	if first.Domain != "svc.io" || first.FirstSeen != "2020-05-09" {
+		t.Errorf("svc.io row wrong: %+v", first)
+	}
+	if first.SampleSubject != "Verify your email" {
+		t.Errorf("sample should prefer verification, got %q", first.SampleSubject)
+	}
+	if !first.MultiSender || first.DistinctSenders != 3 {
+		t.Errorf("multi-sender alert wrong: %+v", first)
+	}
+	if got := strings.Join(first.Categories, ","); got != "verification,welcome,receipt" {
+		t.Errorf("category order wrong: %q", got)
+	}
+	if second.Domain != "old.example" || second.FirstSeen != "" {
+		t.Errorf("undated domain should sort last without a date: %+v", second)
+	}
+
+	var buf bytes.Buffer
+	renderText(&buf, stats)
+	out := buf.String()
+	for _, want := range []string{"MULTIPLE SENDERS", "2020-05-09", "2 unique domains"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("text report missing %q:\n%s", want, out)
+		}
 	}
 }
