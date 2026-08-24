@@ -8,13 +8,20 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
+	"io"
+	"mime"
+	"net"
 	"os"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 // ============================================================================
@@ -117,6 +124,180 @@ func envInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid %s: %w", key, err)
 	}
 	return n, nil
+}
+
+// ============================================================================
+// PIPELINE STAGE 1 — COLLECTION / ETAPA 1 DO PIPELINE — COLETA
+// Connects over TLS, selects the mailbox READ-ONLY and streams only the
+// ENVELOPE (From, Subject, Date) in fixed-size batches. Message bodies are
+// never requested from the server.
+// Conecta via TLS, seleciona a caixa em modo SOMENTE-LEITURA e transmite
+// apenas o ENVELOPE (From, Subject, Date) em lotes de tamanho fixo.
+// O corpo das mensagens nunca é solicitado ao servidor.
+// ============================================================================
+
+// job is one extracted header triplet handed to the worker pool.
+// job é um trio de headers extraído entregue ao pool de workers.
+type job struct {
+	subject string
+	from    string    // original first From address: "local@host"
+	host    string    // lowercase domain part of From
+	date    time.Time // envelope Date header
+}
+
+// decodeSubject decodes RFC 2047 encoded-words ("=?utf-8?...?=") commonly
+// found in Subject headers. Falls back to the raw string on any error so a
+// weird charset can never drop a message from the analysis.
+// decodeSubject decodifica encoded-words RFC 2047 ("=?utf-8?...?=") comuns
+// no Subject. Em caso de erro retorna o texto bruto, para que um charset
+// esquisito jamais derrube uma mensagem da análise.
+var wordDecoder = &mime.WordDecoder{
+	CharsetReader: func(charset string, input io.Reader) (io.Reader, error) {
+		switch strings.ToLower(charset) {
+		case "iso-8859-1", "latin1":
+			// Latin-1 maps bytes 1:1 to Unicode code points U+0000..U+00FF.
+			data, err := io.ReadAll(input)
+			if err != nil {
+				return nil, err
+			}
+			var buf strings.Builder
+			for _, b := range data {
+				buf.WriteRune(rune(b))
+			}
+			return strings.NewReader(buf.String()), nil
+		default:
+			// windows-1252 etc. are not supported without x/text; caller falls back.
+			return nil, fmt.Errorf("unsupported charset %q", charset)
+		}
+	},
+}
+
+func decodeSubject(s string) string {
+	if !strings.Contains(s, "=?") {
+		return s
+	}
+	if d, err := wordDecoder.DecodeHeader(s); err == nil && d != "" {
+		return d
+	}
+	return s
+}
+
+// collectJobs runs the whole collection stage: dial, login, select read-only,
+// list target sequence numbers and fetch ENVELOPEs batch by batch, pushing
+// one job per usable message into jobs. Closes nothing — the caller owns the
+// channel lifecycle.
+//
+// collectJobs executa todo o estágio de coleta: conexão, login, select
+// somente-leitura, listagem dos sequence numbers alvo e busca dos ENVELOPEs
+// lote a lote, empurrando um job por mensagem útil em jobs. Não fecha nada —
+// o dono do canal é quem chama.
+func collectJobs(cfg *Config, jobs chan<- job) error {
+	addr := cfg.Host + ":" + cfg.Port
+
+	// TLS is mandatory: credentials travel inside this session. A dial
+	// timeout keeps the tool from hanging forever on a dead server.
+	// TLS é obrigatório: as credenciais viajam dentro desta sessão. O timeout
+	// de conexão evita que a ferramenta trave eternamente num servidor morto.
+	c, err := imapclient.DialTLS(addr, &imapclient.Options{
+		TLSConfig: &tls.Config{ServerName: cfg.Host},
+		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
+	})
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer func() { c.Logout().Wait() }() // best-effort, never masks real errors
+
+	if err := c.Login(cfg.User, cfg.Password).Wait(); err != nil {
+		return fmt.Errorf("login %s: %w", cfg.User, err)
+	}
+
+	// Read-only select (EXAMINE): guarantees no \Seen flag is ever touched.
+	// Select somente-leitura (EXAMINE): garante que nenhuma flag \Seen seja tocada.
+	sel, err := c.Select(cfg.Mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	if err != nil {
+		return fmt.Errorf("select %q: %w", cfg.Mailbox, err)
+	}
+	total := sel.NumMessages
+
+	// Build the ordered list of message sequence numbers to scan:
+	// - IMAP_SINCE unset -> every message in the mailbox;
+	// - IMAP_SINCE set   -> server-side SEARCH SINCE (internal date).
+	// Monta a lista ordenada de sequence numbers a varrer:
+	// - sem IMAP_SINCE -> todas as mensagens da caixa;
+	// - com IMAP_SINCE -> SEARCH SINCE no servidor (data interna).
+	var seqNums []uint32
+	if cfg.Since == nil {
+		seqNums = make([]uint32, 0, total)
+		for n := uint32(1); n <= total; n++ {
+			seqNums = append(seqNums, n)
+		}
+	} else {
+		searchData, err := c.Search(&imap.SearchCriteria{Since: *cfg.Since}, nil).Wait()
+		if err != nil {
+			return fmt.Errorf("search since %s: %w", cfg.Since.Format(time.RFC3339), err)
+		}
+		switch all := searchData.All.(type) {
+		case imap.SeqSet:
+			nums, ok := all.Nums()
+			if !ok {
+				return fmt.Errorf("server returned an unbounded search result")
+			}
+			seqNums = nums
+		default:
+			return fmt.Errorf("unexpected search result type %T", searchData.All)
+		}
+	}
+
+	// Batched ENVELOPE fetch. Each round trip asks for headers of at most
+	// BATCH_SIZE messages, keeping memory flat on huge mailboxes.
+	// Busca de ENVELOPE em lotes. Cada ida ao servidor pede os headers de no
+	// máximo BATCH_SIZE mensagens, mantendo a memória estável em caixas grandes.
+	fetchOpts := &imap.FetchOptions{Envelope: true}
+	for start := 0; start < len(seqNums); start += cfg.BatchSize {
+		end := min(start+cfg.BatchSize, len(seqNums))
+		seqSet := imap.SeqSetNum(seqNums[start:end]...)
+
+		cmd := c.Fetch(seqSet, fetchOpts)
+	envelopeLoop:
+		for {
+			msg := cmd.Next() // nil when this batch is exhausted
+			if msg == nil {
+				break
+			}
+			for {
+				item := msg.Next() // nil when all items of this message are done
+				if item == nil {
+					break
+				}
+				envData, ok := item.(imapclient.FetchItemDataEnvelope)
+				if !ok {
+					continue
+				}
+				env := envData.Envelope
+				// Skip messages with no parsable From — nothing to attribute them to.
+				// Descarta mensagens sem From parseável — nada a que atribuí-las.
+				if env == nil || len(env.From) == 0 {
+					continue
+				}
+				from := env.From[0]
+				host := strings.ToLower(strings.TrimSuffix(from.Host, "."))
+				if host == "" {
+					continue
+				}
+				jobs <- job{
+					subject: decodeSubject(env.Subject),
+					from:    from.Mailbox + "@" + from.Host,
+					host:    host,
+					date:    env.Date,
+				}
+				continue envelopeLoop
+			}
+		}
+		if err := cmd.Close(); err != nil {
+			return fmt.Errorf("fetch batch [%d..%d): %w", start, end, err)
+		}
+	}
+	return nil
 }
 
 // ============================================================================
@@ -228,11 +409,34 @@ func main() {
 	}
 	categories := buildCategories()
 
-	// Temporary scaffold output; replaced by the real pipeline in next commits.
-	// Saída provisória do scaffold; substituída pelo pipeline nos próximos commits.
-	fmt.Printf("host=%s port=%s mailbox=%s since=%v workers=%d batch=%d ignored=%d categories=%d\n",
-		cfg.Host, cfg.Port, cfg.Mailbox, cfg.Since, cfg.Workers, cfg.BatchSize,
-		len(cfg.Ignore), len(categories))
+	// Stage 1: producer goroutine streams header jobs from IMAP.
+	// Etapa 1: goroutine produtora transmite jobs de headers do IMAP.
+	jobs := make(chan job, cfg.BatchSize)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(jobs)
+		if err := collectJobs(cfg, jobs); err != nil {
+			errCh <- err
+		}
+	}()
+
+	// Temporary drain; replaced by the worker pool in the next commit.
+	// Dreno temporário; substituído pelo pool de workers no próximo commit.
+	count := 0
+	for j := range jobs {
+		count++
+		if count <= 3 {
+			fmt.Printf("sample: date=%s from=%s subject=%.60q\n",
+				j.date.Format("2006-01-02"), j.from, j.subject)
+		}
+	}
+
+	if err := <-errCh; err != nil {
+		fmt.Fprintf(os.Stderr, "collect error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("collected %d headers (workers=%d batch=%d categories=%d ignored=%d)\n",
+		count, cfg.Workers, cfg.BatchSize, len(categories), len(cfg.Ignore))
 }
 
 // ============================================================================
