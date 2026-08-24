@@ -1,0 +1,62 @@
+[
+  {
+    "subject": "Verify your email address",
+    "from": "noreply@svc.io",
+    "host": "mail.svc.io",
+    "date": "2020-05-09T12:00:00Z"
+  },
+  {
+    "subject": "Welcome to svc",
+    "from": "team@svc.io",
+    "host": "svc.io",
+    "date": "2020-05-10T09:00:00Z"
+  },
+  {
+    "subject": "Sua fatura está disponível",
+    "from": "billing@svc.io",
+    "host": "billing.svc.io",
+    "date": "2021-01-01T00:00:00Z"
+  },
+  {
+    "subject": "New login from Chrome on Windows",
+    "from": "security@shopnow.example",
+    "host": "shopnow.example",
+    "date": "2023-11-05T08:30:00Z"
+  },
+  {
+    "subject": "Pedido recebido #777",
+    "from": "orders@shopnow.example",
+    "host": "shopnow.example",
+    "date": "2023-11-06T10:00:00Z"
+  },
+  {
+    "subject": "Termos de uso atualizados",
+    "from": "no-reply@oldblog.net",
+    "host": "mail.oldblog.net",
+    "date": "2021-07-15T14:00:00Z"
+  },
+  {
+    "subject": "Welcome to Netflix",
+    "from": "info@netflix.com",
+    "host": "netflix.com",
+    "date": "2020-01-01T00:00:00Z"
+  },
+  {
+    "subject": "Weekly digest",
+    "from": "news@zine.example",
+    "host": "zine.example",
+    "date": "2022-02-02T00:00:00Z"
+  },
+  {
+    "subject": "Sua conta foi criada",
+    "from": "team@cloudnotes.io",
+    "host": "cloudnotes.io",
+    "date": ""
+  },
+  {
+    "subject": "=?utf-8?b?U2VuaGEgYWx0ZXJhZGEgY29tIHN1Y2Vzc28=?=",
+    "from": "alerts@safevault.io",
+    "host": "safevault.io",
+    "date": "2024-02-20T18:00:00Z"
+  }
+]
