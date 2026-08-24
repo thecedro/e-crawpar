@@ -34,6 +34,19 @@ Seu e-mail guarda pistas: quando você cria conta num site, quase sempre chega u
 
 Programas externos não podem entrar no seu e-mail com a senha normal. Você precisa criar uma **senha de aplicativo**: uma senha especial, só para este programa, que pode ser revogada quando quiser. Escolha abaixo o passo a passo do seu provedor.
 
+### ⚠️ O meu provedor funciona?
+
+O e-crawpar entende um único idioma: **IMAP clássico com criptografia TLS**, autenticado por **senha de aplicativo**. Isso exclui alguns serviços:
+
+- ✔ **Funciona** com qualquer provedor que dê acesso IMAP ao próprio usuário *e* ofereça senha de app — Gmail, Outlook e Yahoo têm guias abaixo; vários outros entram pela opção **4 (outro)** do assistente, informando host e porta oficiais de IMAP.
+- ✖ **Não funciona** com provedores **fechados**. Existem três sabores de fechamento:
+  1. não oferecem IMAP nenhum — o acesso é só pelo site/app deles;
+  2. exigem login moderno (OAuth / botão "Entrar com…") e **não disponibilizam senha de app**;
+  3. liberam IMAP apenas por meio de um programa-ponte próprio, às vezes pago, rodando na sua máquina.
+
+  Nesses casos não existe configuração possível: o servidor simplesmente nunca aceitará este tipo de conexão — limitação deles, não defeito do programa. O e-crawpar **não usa OAuth** por decisão de segurança (evitaria armazenar tokens amplos na sua máquina).
+- 🔎 **Teste rápido**: pegue o endereço oficial de IMAP do seu provedor, escolha a opção 4 do assistente, cole uma senha de app válida. Login recusado com senha de app correta = provedor fechado para esse tipo de acesso.
+
 #### 📧 Gmail (google.com)
 
 1. Acesse **myaccount.google.com** e faça login.
@@ -131,14 +144,15 @@ Big techs, bancos conhecidos e serviços de monitoramento vêm filtrados por pad
 
 ### Customização avançada (para quem mexe com código)
 
-Tudo fica em `main.go`, bem comentado e bilíngue:
+A lógica vive em pacotes internos pequenos e bilíngues:
 
 | O quê | Onde |
 |---|---|
-| Padrões de regex por categoria (PT/EN) | `categorySpecs` — ordem = prioridade |
-| Domínios ignorados | `defaultIgnoreDomains` + variável `IGNORE_DOMAINS=a.com,b.com` |
-| Prefixos transacionais agrupados (`mail.`, `billing.`…) | `transactionalPrefixes` |
+| Padrões de regex por categoria (PT/EN) | `internal/core/categories.go` — `categorySpecs`, ordem = prioridade |
+| Domínios ignorados | `internal/core/sender.go` (`defaultIgnoreDomains`) + variável `IGNORE_DOMAINS=a.com,b.com` |
+| Prefixos transacionais agrupados (`mail.`, `billing.`…) | `internal/core/sender.go` (`transactionalPrefixes`) |
 | Workers e tamanho de lote | variáveis `WORKERS`, `BATCH_SIZE` |
+| Coleta IMAP (somente-leitura, só ENVELOPE) | `internal/imapx/imapx.go` |
 
 Detalhes técnicos, arquitetura do pipeline e guias de contribuição: [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
@@ -167,6 +181,19 @@ Ever wondered *"where did I sign up all these years?"*. e-crawpar scans your own
 ### Create an app password first
 
 Third-party apps cannot log in with your regular password. You need an **app password** — a special, revocable one.
+
+### ⚠️ Will my provider work?
+
+e-crawpar speaks exactly one dialect: **classic IMAP over TLS**, authenticated with an **app password**. That rules some services out:
+
+- ✔ **Works** with any provider that gives users direct IMAP access *and* offers app passwords — Gmail, Outlook and Yahoo have guides below; many others work through wizard option **4 (other)** using the provider's official IMAP host/port.
+- ✖ **Does not work** with **walled-garden** providers, in three flavors:
+  1. no IMAP at all — access happens only through their own site/apps;
+  2. modern login only (OAuth / "Sign in with…") with **no app-password option**;
+  3. IMAP allowed only through their own bridge program, sometimes paid, running locally.
+
+  In those cases nothing can be configured: the server will simply never accept this kind of connection — their limitation, not a bug. e-crawpar deliberately **does not use OAuth** (that would mean storing broad tokens on your machine).
+- 🔎 **Quick test**: grab your provider's official IMAP address, pick wizard option 4, paste a valid app password. Login rejected even with a correct app password = the provider is closed to this kind of access.
 
 <details>
 <summary><strong>Gmail step by step</strong></summary>
@@ -262,7 +289,7 @@ Big techs, known banks and monitoring services are filtered out by default.
 
 ### Advanced customization & development
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for architecture, code layout, tests and contribution guidelines. Regex patterns live in `categorySpecs`, ignored domains in `defaultIgnoreDomains` + env `IGNORE_DOMAINS`, transactional prefixes in `transactionalPrefixes`, pool sizing in `WORKERS`/`BATCH_SIZE`.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for architecture, code layout, tests and contribution guidelines. Regex patterns live in `internal/core/categories.go`, ignored domains and transactional prefixes in `internal/core/sender.go` + env `IGNORE_DOMAINS`, IMAP collection in `internal/imapx/`, pool sizing in `WORKERS`/`BATCH_SIZE`.
 
 ## License / Licença
 
