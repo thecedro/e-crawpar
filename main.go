@@ -21,7 +21,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/tabwriter"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -693,43 +692,17 @@ func sampleRank(category string) (int, bool) {
 }
 
 // ============================================================================
-// PIPELINE STAGE 4 — REPORT / ETAPA 4 DO PIPELINE — RELATÓRIO
-// Human-readable table on stdout by default; pretty JSON with -json.
-// Tabela legível no stdout por padrão; JSON formatado com -json.
+// PIPELINE STAGE 4 — REPORT DISPATCH / ETAPA 4 DO PIPELINE — SAÍDAS
+// The terminal table always renders; -json adds machine output and -html
+// writes a navigable standalone page.
+//
+// A tabela no terminal sempre é exibida; -json acrescenta saída para máquinas
+// e -html grava uma página standalone navegável.
 // ============================================================================
-
-// renderText prints the aligned report table plus multi-sender alerts.
-// renderText imprime a tabela alinhada do relatório com alertas de múltiplos
-// remetentes.
-func renderText(w io.Writer, stats []domainStat) {
-	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "FIRST SEEN\tDOMAIN\tOCCUR\tCATEGORIES\tSENDERS\t")
-	for _, s := range stats {
-		first := s.FirstSeen
-		if first == "" {
-			first = "?"
-		}
-		line := fmt.Sprintf("%s\t%s\t%d\t%s\t%d\t",
-			first, s.Domain, s.Occurrences,
-			strings.Join(s.Categories, ", "), s.DistinctSenders)
-		if s.MultiSender {
-			line += "  << MULTIPLE SENDERS"
-		}
-		fmt.Fprintln(tw, line)
-	}
-	tw.Flush()
-
-	// Sample subjects come after the table so long lines never break it.
-	// Assuntos exemplo vêm após a tabela para não quebrá-la.
-	fmt.Fprintln(w, "\nSample subjects:")
-	for _, s := range stats {
-		fmt.Fprintf(w, "  %s\n    %q\n", s.Domain, s.SampleSubject)
-	}
-	fmt.Fprintf(w, "\n%d unique domains found.\n", len(stats))
-}
 
 func main() {
 	jsonOut := flag.Bool("json", false, "also print the report as JSON")
+	htmlOut := flag.Bool("html", false, "also write a navigable HTML report (e-crawpar-report.html)")
 	flag.Parse()
 
 	// Stage 0: bootstrap configuration — .env + OS env, or the interactive
@@ -780,6 +753,14 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(string(out))
+	}
+	if *htmlOut {
+		path, err := writeHTMLReport(stats)
+		if err != nil {
+			printFriendly(err)
+			os.Exit(1)
+		}
+		fmt.Printf("\nHTML report: %s\n  PT Abra este arquivo no navegador para uma tabela com busca e ordenação.\n  EN Open this file in your browser for a searchable, sortable table.\n", path)
 	}
 }
 

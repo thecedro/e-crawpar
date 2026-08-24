@@ -340,3 +340,43 @@ func TestLoadConfigMissingEnv(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteHTMLReport ensures the standalone page is generated with escaped
+// subjects (XSS-safe) and correct counters.
+//
+// TestWriteHTMLReport garante que a página standalone é gerada com assuntos
+// escapados (seguro contra XSS) e contadores corretos.
+func TestWriteHTMLReport(t *testing.T) {
+	dir := t.TempDir()
+	oldWd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(oldWd) })
+	os.Chdir(dir) // report is written to cwd; keep test sandboxed
+
+	stats := []domainStat{
+		{Domain: "svc.io", FirstSeen: "2020-05-09", Categories: []string{"verification", "welcome"},
+			Occurrences: 2, SampleSubject: `Verify <script>alert(1)</script>`,
+			DistinctSenders: 3, MultiSender: true},
+	}
+	path, err := writeHTMLReport(stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(raw)
+
+	if strings.Contains(html, "<script>alert(1)</script>") {
+		t.Error("subject must be HTML-escaped") // template auto-escaping
+	}
+	for _, want := range []string{
+		"&lt;script&gt;", // escaped payload
+		"svc.io", "2020-05-09", "múltiplos",
+		"1</b>", // total domains counter
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("html missing %q", want)
+		}
+	}
+}

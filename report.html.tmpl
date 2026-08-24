@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>e-crawpar report</title>
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --text:#e8ecf4; --muted:#93a0b8;
+          --line:#2a3550; --accent:#5b9dff; --warn:#ffb45b; --ok:#7bd88f; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text);
+         font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { margin-bottom:20px; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .meta { color:var(--muted); font-size:13px; }
+  .stats { display:flex; gap:16px; margin:16px 0; flex-wrap:wrap; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:10px 18px; }
+  .stat b { font-size:20px; display:block; color:var(--accent); }
+  input#q { width:100%; max-width:420px; padding:9px 12px; margin-bottom:14px;
+            background:var(--card); border:1px solid var(--line);
+            border-radius:8px; color:var(--text); font-size:14px; }
+  table { width:100%; border-collapse:collapse; background:var(--card);
+          border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th,td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); }
+  th { background:#202a40; cursor:pointer; user-select:none; white-space:nowrap; }
+  th:hover { color:var(--accent); }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:hover td { background:#212c46; }
+  tr.empty td { color:var(--warn); }
+  .badge { display:inline-block; margin:1px 3px 1px 0; padding:1px 8px;
+           border-radius:99px; font-size:12px; border:1px solid var(--line); }
+  .badge.security{color:#ff8080} .badge.verification{color:#ffd479}
+  .badge.welcome{color:#7bd88f} .badge.receipt{color:#79c0ff}
+  .badge.policy{color:#c8a6ff}
+  .multi { color:var(--warn); font-weight:600; white-space:nowrap; }
+  footer { margin-top:18px; color:var(--muted); font-size:12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔎 e-crawpar — contas descobertas / accounts discovered</h1>
+  <div class="meta">
+    Gerado em / Generated at {{.GeneratedAt}} ·
+    ordenado pela primeira ocorrência (nascimento da conta) /
+    ordered by first occurrence (account birthday)
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat"><b>{{.TotalDomains}}</b> domínios / domains</div>
+  <div class="stat"><b>{{.TotalOccurrences}}</b> e-mails analisados / emails matched</div>
+</div>
+
+<input id="q" type="search" placeholder="Filtrar por domínio ou categoria… / Filter by domain or category…">
+
+<table id="t">
+<thead><tr>
+  <th data-k="first">Primeira vez ▾</th>
+  <th data-k="domain">Domínio</th>
+  <th data-k="occur" class="num">E-mails</th>
+  <th data-k="cats">Categorias</th>
+  <th data-k="senders">Remetentes distintos</th>
+  <th>Assunto exemplo</th>
+</tr></thead>
+<tbody>
+{{- range .Rows}}
+<tr data-first="{{if .FirstSeen}}{{.FirstSeen}}{{else}}9999{{end}}"
+    data-domain="{{.Domain}}" data-occur="{{.Occurrences}}" data-senders="{{.DistinctSenders}}"
+    data-cats="{{join .Categories " "}}">
+  <td>{{if .FirstSeen}}{{.FirstSeen}}{{else}}?{{end}}</td>
+  <td><strong>{{.Domain}}</strong></td>
+  <td class="num">{{.Occurrences}}</td>
+  <td>{{range .Categories}}<span class="badge {{.}}">{{.}}</span>{{end}}</td>
+  <td>{{.DistinctSenders}}{{if .MultiSender}} <span class="multi">⚠ múltiplos</span>{{end}}</td>
+  <td>{{.SampleSubject}}</td>
+</tr>
+{{- end}}
+</tbody>
+</table>
+
+<footer>
+  🔒 Dados gerados localmente a partir dos cabeçalhos dos seus e-mails.
+  Nada aqui foi enviado para nenhum servidor.<br>
+  Data generated locally from your e-mail headers. Nothing here was sent to any server.
+</footer>
+
+<script>
+// Client-side filter + column sorting; no external assets.
+// Filtro e ordenação no navegador; nenhum recurso externo.
+const q = document.getElementById('q');
+const tbody = document.querySelector('#t tbody');
+let rows = Array.from(tbody.rows);
+
+q.addEventListener('input', () => {
+  const needle = q.value.toLowerCase();
+  for (const r of rows) {
+    r.style.display = r.textContent.toLowerCase().includes(needle) ? '' : 'none';
+  }
+});
+
+document.querySelectorAll('th[data-k]').forEach((th, i) => {
+  let asc = false;
+  th.addEventListener('click', () => {
+    asc = !asc;
+    const key = th.dataset.k;
+    rows.sort((a, b) => {
+      let va = a.dataset[key] ?? '', vb = b.dataset[key] ?? '';
+      // numeric columns compare numerically, dates/strings lexically
+      if (key === 'occur' || key === 'senders') {
+        return asc ? va - vb : vb - va;
+      }
+      return asc ? va.localeCompare(vb) : vb.localeCompare(va);
+    });
+    rows.forEach(r => tbody.appendChild(r));
+  });
+});
+</script>
+</body>
+</html>
