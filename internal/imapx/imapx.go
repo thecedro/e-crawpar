@@ -180,7 +180,7 @@ func (a ClientAdapter) Fetch(seqNums []uint32, opts *imap.FetchOptions, emit fun
 // Logout implements IMAPClient (best-effort at call sites; never masks real
 // errors because callers ignore its result on deferred paths).
 func (a ClientAdapter) Logout() error {
-	a.C.Logout().Wait()
+	_ = a.C.Logout().Wait()
 	return nil
 }
 

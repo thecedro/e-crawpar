@@ -73,8 +73,8 @@ func TestDotEnvRoundTrip(t *testing.T) {
 func TestRunSetupWizard(t *testing.T) {
 	dir := t.TempDir()
 	oldWd, _ := os.Getwd()
-	t.Cleanup(func() { os.Chdir(oldWd) })
-	os.Chdir(dir) // wizard writes .env to cwd; keep test sandboxed
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+	_ = os.Chdir(dir) // wizard writes .env to cwd; keep test sandboxed
 
 	// Stub the network probe: fail twice, then succeed. No real IMAP traffic.
 	// Simula a validação: falha duas vezes, depois funciona. Sem tráfego real.

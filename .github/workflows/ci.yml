@@ -49,9 +49,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # Pinned: v1.x binaries (the old action default) are built with older Go
+      # and produce bogus "undefined:" typecheck errors against Go 1.26 stdlib.
+      # Fixado: binários v1.x (default antigo da action) vêm compilados com Go
+      # mais velho e geram erros typecheck falsos de "undefined:" com stdlib 1.26.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
+          version: v2.13.1
           args: --new-from-rev HEAD~1
 
   unit:

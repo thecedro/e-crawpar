@@ -32,7 +32,7 @@ import (
 // tabela para não quebrá-la.
 func RenderText(w io.Writer, stats []core.DomainStat) {
 	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "FIRST SEEN\tDOMAIN\tOCCUR\tCATEGORIES\tSENDERS\t")
+	_, _ = fmt.Fprintln(tw, "FIRST SEEN\tDOMAIN\tOCCUR\tCATEGORIES\tSENDERS\t")
 	for _, s := range stats {
 		first := s.FirstSeen
 		if first == "" {
@@ -44,15 +44,15 @@ func RenderText(w io.Writer, stats []core.DomainStat) {
 		if s.MultiSender {
 			line += "  << MULTIPLE SENDERS"
 		}
-		fmt.Fprintln(tw, line)
+		_, _ = fmt.Fprintln(tw, line)
 	}
-	tw.Flush()
+	_ = tw.Flush()
 
-	fmt.Fprintln(w, "\nSample subjects:")
+	_, _ = fmt.Fprintln(w, "\nSample subjects:")
 	for _, s := range stats {
-		fmt.Fprintf(w, "  %s\n    %q\n", s.Domain, s.SampleSubject)
+		_, _ = fmt.Fprintf(w, "  %s\n    %q\n", s.Domain, s.SampleSubject)
 	}
-	fmt.Fprintf(w, "\n%d unique domains found.\n", len(stats))
+	_, _ = fmt.Fprintf(w, "\n%d unique domains found.\n", len(stats))
 }
 
 // --- HTML report / relatório em HTML ---
@@ -120,7 +120,7 @@ func WriteHTMLReportTo(dir string, stats []core.DomainStat) (string, error) {
 			fmt.Sprintf("Verifique permissões de escrita na pasta atual (%v) ou rode de outra pasta.", err),
 			fmt.Sprintf("Check write permissions in the current folder (%v) or run from another folder.", err))
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	if err := tmpl.Execute(f, data); err != nil {
 		return "", fmt.Errorf("html render: %w", err)

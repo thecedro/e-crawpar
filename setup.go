@@ -101,7 +101,7 @@ func renderDotEnv(values map[string]string) string {
 	b.WriteString("# Credenciais do e-crawpar - mantenha este arquivo PRIVADO!\n")
 	for _, k := range keys {
 		if v := values[k]; v != "" {
-			fmt.Fprintf(&b, "%s=%q\n", k, v)
+			_, _ = fmt.Fprintf(&b, "%s=%q\n", k, v)
 		}
 	}
 	return b.String()
@@ -119,23 +119,23 @@ func writeDotEnv(path string, values map[string]string) error {
 // promptLine lê uma resposta aparada e não vazia de r.
 func promptLine(r *bufio.Reader, w interface{ Write([]byte) (int, error) }, label string) string {
 	for {
-		fmt.Fprint(w, label+" ")
+		_, _ = fmt.Fprint(w, label+" ")
 		line, _ := r.ReadString('\n')
 		line = strings.TrimSpace(line)
 		if line != "" {
 			return line
 		}
-		fmt.Fprintln(w, "  Valor vazio, tente de novo. / Empty value, try again.")
+		_, _ = fmt.Fprintln(w, "  Valor vazio, tente de novo. / Empty value, try again.")
 	}
 }
 
 // promptPassword reads a secret with echo disabled when possible.
 // promptPassword lê um segredo com eco desativado quando possível.
 func promptPassword(r *bufio.Reader, w interface{ Write([]byte) (int, error) }, label string) string {
-	fmt.Fprint(w, label+" ")
+	_, _ = fmt.Fprint(w, label+" ")
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		secret, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Fprintln(w) // restore newline killed by raw mode / restaura a quebra de linha
+		_, _ = fmt.Fprintln(w) // restore newline killed by raw mode / restaura a quebra de linha
 		if err == nil && len(secret) > 0 {
 			return strings.TrimSpace(string(secret))
 		}
@@ -176,15 +176,15 @@ var probeAccountFn = probeAccount
 // runSetup conduz o assistente interativo até produzir credenciais válidas ou
 // até esgotar três tentativas de validação.
 func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) }) (map[string]string, error) {
-	fmt.Fprintln(stdout, "\n== Bem-vindo ao e-crawpar! Vamos configurar sua conta uma única vez. ==")
-	fmt.Fprintln(stdout, "== Welcome to e-crawpar! Let's set up your account just once. ==")
-	fmt.Fprintln(stdout, "\nDe onde é seu e-mail? / Which provider is your e-mail from?")
+	_, _ = fmt.Fprintln(stdout, "\n== Bem-vindo ao e-crawpar! Vamos configurar sua conta uma única vez. ==")
+	_, _ = fmt.Fprintln(stdout, "== Welcome to e-crawpar! Let's set up your account just once. ==")
+	_, _ = fmt.Fprintln(stdout, "\nDe onde é seu e-mail? / Which provider is your e-mail from?")
 	for i, p := range providers {
-		fmt.Fprintf(stdout, "  %d) %s\n", i+1, p.Label)
+		_, _ = fmt.Fprintf(stdout, "  %d) %s\n", i+1, p.Label)
 	}
 	choice := promptLine(stdin, stdout, fmt.Sprintf("Escolha 1-%d / Pick 1-%d:", len(providers), len(providers)))
 	idx := -1
-	for _, c := range []rune(choice) {
+	for _, c := range choice {
 		if c >= '1' && c <= rune('0'+len(providers)) {
 			idx = int(c - '1')
 			break
@@ -205,7 +205,7 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 
 	values := map[string]string{"IMAP_HOST": host, "IMAP_PORT": p.Port, "IMAP_USER": email}
 
-	fmt.Fprintln(stdout, "\nTestando a conexão... / Testing the connection...")
+	_, _ = fmt.Fprintln(stdout, "\nTestando a conexão... / Testing the connection...")
 	for attempt := 1; attempt <= 3; attempt++ {
 		err := probeAccountFn(host, p.Port, email, pass)
 		if err == nil {
@@ -217,17 +217,17 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 					fmt.Sprintf("Verifique permissões de escrita na pasta atual (%v).", werr),
 					fmt.Sprintf("Check write permissions in the current folder (%v).", werr))
 			}
-			fmt.Fprintf(stdout, "\n✓ Conectado! Credenciais salvas em %q.\n", envFile)
-			fmt.Fprintf(stdout, "✓ Connected! Credentials saved to %q.\n", envFile)
-			fmt.Fprintln(stdout, "  O arquivo é privado (permissão 600) e está no .gitignore.")
-			fmt.Fprintln(stdout, "  The file is private (permission 600) and git-ignored.")
+			_, _ = fmt.Fprintf(stdout, "\n✓ Conectado! Credenciais salvas em %q.\n", envFile)
+			_, _ = fmt.Fprintf(stdout, "✓ Connected! Credentials saved to %q.\n", envFile)
+			_, _ = fmt.Fprintln(stdout, "  O arquivo é privado (permissão 600) e está no .gitignore.")
+			_, _ = fmt.Fprintln(stdout, "  The file is private (permission 600) and git-ignored.")
 			return values, nil
 		}
 		apperr.PrintFriendly(err)
 		if attempt == 3 {
 			break
 		}
-		fmt.Fprintln(stdout, "\nVamos tentar de novo. / Let's try again.")
+		_, _ = fmt.Fprintln(stdout, "\nVamos tentar de novo. / Let's try again.")
 		email = promptLine(stdin, stdout, "E-mail completo:")
 		pass = promptPassword(stdin, stdout, "Senha de APP:")
 		values["IMAP_USER"] = email
