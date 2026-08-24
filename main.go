@@ -1,30 +1,34 @@
-// Package main implements an IMAP crawler that scans the headers
+// e-crawpar is an IMAP crawler that scans the headers
 // (From, Subject, Date) of your own mailbox to discover which services
 // you have accounts with — without ever downloading message bodies.
 //
-// O pacote main implementa um crawler IMAP que varre os headers
-// (From, Subject, Date) da sua própria caixa de e-mail para descobrir
-// em quais serviços você tem conta — sem nunca baixar o corpo das mensagens.
+// e-crawpar é um crawler IMAP que varre os headers (From, Subject, Date)
+// da sua própria caixa de e-mail para descobrir em quais serviços você tem
+// conta — sem nunca baixar o corpo das mensagens.
+//
+// This file is only pipeline wiring. The stages live in internal packages:
+// collection in internal/imapx, classification/aggregation in internal/core,
+// output in internal/report and error translation in internal/apperr.
+//
+// Este arquivo é só a fiação do pipeline. Os estágios vivem nos pacotes
+// internos: coleta em internal/imapx, classificação/agregação em
+// internal/core, saída em internal/report e tradução de erros em
+// internal/apperr.
 package main
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"mime"
-	"net"
 	"os"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/emersion/go-imap/v2"
-	"github.com/emersion/go-imap/v2/imapclient"
+	"e-crawpar/internal/apperr"
+	"e-crawpar/internal/core"
+	"e-crawpar/internal/imapx"
+	"e-crawpar/internal/report"
 )
 
 // ============================================================================
@@ -117,7 +121,7 @@ func loadConfig(file map[string]string) (*Config, error) {
 	// Noise filter: built-in defaults extended by IGNORE_DOMAINS.
 	// Filtro de ruído: defaults embutidos estendidos por IGNORE_DOMAINS.
 	cfg.Ignore = map[string]bool{}
-	for _, d := range defaultIgnoreDomains {
+	for _, d := range core.DefaultIgnoreDomains {
 		cfg.Ignore[d] = true
 	}
 	if extra := lookup("IGNORE_DOMAINS"); extra != "" {
@@ -145,560 +149,10 @@ func lookupInt(lookup func(string) string, key string, def int) (int, error) {
 	}
 	n, err := strconv.Atoi(raw)
 	if err != nil {
-		return 0, fmt.Errorf("invalid %s: %w", key, err)
+		return 0, fmt.Errorf("invalid %s (want number): %w", key, err)
 	}
 	return n, nil
 }
-
-// ============================================================================
-// PIPELINE STAGE 1 — COLLECTION / ETAPA 1 DO PIPELINE — COLETA
-// Connects over TLS, selects the mailbox READ-ONLY and streams only the
-// ENVELOPE (From, Subject, Date) in fixed-size batches. Message bodies are
-// never requested from the server.
-// Conecta via TLS, seleciona a caixa em modo SOMENTE-LEITURA e transmite
-// apenas o ENVELOPE (From, Subject, Date) em lotes de tamanho fixo.
-// O corpo das mensagens nunca é solicitado ao servidor.
-// ============================================================================
-
-// job is one extracted header triplet handed to the worker pool.
-// job é um trio de headers extraído entregue ao pool de workers.
-type job struct {
-	subject string
-	from    string    // original first From address: "local@host"
-	host    string    // lowercase domain part of From
-	date    time.Time // envelope Date header
-}
-
-// decodeSubject decodes RFC 2047 encoded-words ("=?utf-8?...?=") commonly
-// found in Subject headers. Falls back to the raw string on any error so a
-// weird charset can never drop a message from the analysis.
-// decodeSubject decodifica encoded-words RFC 2047 ("=?utf-8?...?=") comuns
-// no Subject. Em caso de erro retorna o texto bruto, para que um charset
-// esquisito jamais derrube uma mensagem da análise.
-var wordDecoder = &mime.WordDecoder{
-	CharsetReader: func(charset string, input io.Reader) (io.Reader, error) {
-		switch strings.ToLower(charset) {
-		case "iso-8859-1", "latin1":
-			// Latin-1 maps bytes 1:1 to Unicode code points U+0000..U+00FF.
-			data, err := io.ReadAll(input)
-			if err != nil {
-				return nil, err
-			}
-			var buf strings.Builder
-			for _, b := range data {
-				buf.WriteRune(rune(b))
-			}
-			return strings.NewReader(buf.String()), nil
-		default:
-			// windows-1252 etc. are not supported without x/text; caller falls back.
-			return nil, fmt.Errorf("unsupported charset %q", charset)
-		}
-	},
-}
-
-func decodeSubject(s string) string {
-	if !strings.Contains(s, "=?") {
-		return s
-	}
-	if d, err := wordDecoder.DecodeHeader(s); err == nil && d != "" {
-		return d
-	}
-	return s
-}
-
-// readOnlySelect is the only select mode this tool ever uses: the mailbox is
-// opened EXAMINE-style, so no flag (including \Seen) can change.
-//
-// readOnlySelect é o único modo de seleção que a ferramenta usa: a caixa é
-// aberta em estilo EXAMINE, então nenhuma flag (inclusive \Seen) muda.
-var readOnlySelect = &imap.SelectOptions{ReadOnly: true}
-
-// dialIMAP opens the TLS session with sane timeouts. TLS is mandatory:
-// credentials travel inside this session.
-//
-// dialIMAP abre a sessão TLS com timeouts razoáveis. TLS é obrigatório: as
-// credenciais viajam dentro desta sessão.
-func dialIMAP(host, port string) (*imapclient.Client, error) {
-	return imapclient.DialTLS(host+":"+port, &imapclient.Options{
-		TLSConfig: &tls.Config{ServerName: host},
-		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
-	})
-}
-
-// collectJobs runs the whole collection stage: dial, login, select read-only,
-// list target sequence numbers and fetch ENVELOPEs batch by batch, pushing
-// one job per usable message into jobs. Closes nothing — the caller owns the
-// channel lifecycle.
-//
-// collectJobs executa todo o estágio de coleta: conexão, login, select
-// somente-leitura, listagem dos sequence numbers alvo e busca dos ENVELOPEs
-// lote a lote, empurrando um job por mensagem útil em jobs. Não fecha nada —
-// o dono do canal é quem chama.
-func collectJobs(cfg *Config, jobs chan<- job) error {
-	c, err := dialIMAP(cfg.Host, cfg.Port)
-	if err != nil {
-		return friendlyDialError(err, cfg.Host+":"+cfg.Port) // translated for non-technical users
-	}
-	defer func() { c.Logout().Wait() }() // best-effort, never masks real errors
-
-	if err := c.Login(cfg.User, cfg.Password).Wait(); err != nil {
-		return friendlyAuthError(err, cfg.User)
-	}
-
-	// Read-only select (EXAMINE): guarantees no \Seen flag is ever touched.
-	// Select somente-leitura (EXAMINE): garante que nenhuma flag \Seen seja tocada.
-	sel, err := c.Select(cfg.Mailbox, readOnlySelect).Wait()
-	if err != nil {
-		return friendlySelectError(err, cfg.Mailbox)
-	}
-	total := sel.NumMessages
-
-	// Build the ordered list of message sequence numbers to scan:
-	// - IMAP_SINCE unset -> every message in the mailbox;
-	// - IMAP_SINCE set   -> server-side SEARCH SINCE (internal date).
-	// Monta a lista ordenada de sequence numbers a varrer:
-	// - sem IMAP_SINCE -> todas as mensagens da caixa;
-	// - com IMAP_SINCE -> SEARCH SINCE no servidor (data interna).
-	var seqNums []uint32
-	if cfg.Since == nil {
-		seqNums = make([]uint32, 0, total)
-		for n := uint32(1); n <= total; n++ {
-			seqNums = append(seqNums, n)
-		}
-	} else {
-		searchData, err := c.Search(&imap.SearchCriteria{Since: *cfg.Since}, nil).Wait()
-		if err != nil {
-			return fmt.Errorf("search since %s: %w", cfg.Since.Format(time.RFC3339), err)
-		}
-		switch all := searchData.All.(type) {
-		case imap.SeqSet:
-			nums, ok := all.Nums()
-			if !ok {
-				return fmt.Errorf("server returned an unbounded search result")
-			}
-			seqNums = nums
-		default:
-			return fmt.Errorf("unexpected search result type %T", searchData.All)
-		}
-	}
-
-	// Batched ENVELOPE fetch. Each round trip asks for headers of at most
-	// BATCH_SIZE messages, keeping memory flat on huge mailboxes.
-	// Busca de ENVELOPE em lotes. Cada ida ao servidor pede os headers de no
-	// máximo BATCH_SIZE mensagens, mantendo a memória estável em caixas grandes.
-	fetchOpts := &imap.FetchOptions{Envelope: true}
-	for start := 0; start < len(seqNums); start += cfg.BatchSize {
-		end := min(start+cfg.BatchSize, len(seqNums))
-		seqSet := imap.SeqSetNum(seqNums[start:end]...)
-
-		cmd := c.Fetch(seqSet, fetchOpts)
-	envelopeLoop:
-		for {
-			msg := cmd.Next() // nil when this batch is exhausted
-			if msg == nil {
-				break
-			}
-			for {
-				item := msg.Next() // nil when all items of this message are done
-				if item == nil {
-					break
-				}
-				envData, ok := item.(imapclient.FetchItemDataEnvelope)
-				if !ok {
-					continue
-				}
-				env := envData.Envelope
-				// Skip messages with no parsable From — nothing to attribute them to.
-				// Descarta mensagens sem From parseável — nada a que atribuí-las.
-				if env == nil || len(env.From) == 0 {
-					continue
-				}
-				from := env.From[0]
-				host := strings.ToLower(strings.TrimSuffix(from.Host, "."))
-				if host == "" {
-					continue
-				}
-				jobs <- job{
-					subject: decodeSubject(env.Subject),
-					from:    from.Mailbox + "@" + from.Host,
-					host:    host,
-					date:    env.Date,
-				}
-				continue envelopeLoop
-			}
-		}
-		if err := cmd.Close(); err != nil {
-			return fmt.Errorf("fetch batch [%d..%d): %w", start, end, err)
-		}
-	}
-	return nil
-}
-
-// ============================================================================
-// PIPELINE STAGE 2 — WORKER POOL / ETAPA 2 DO PIPELINE — POOL DE WORKERS
-// N goroutines consume jobs from a shared channel, classify the subject,
-// normalize the sender domain, apply the noise filter and emit results into
-// a single channel. The collector (stage 3) is the only writer of the
-// aggregate state, so no mutex is needed.
-//
-// N goroutines consomem jobs de um canal compartilhado, classificam o
-// assunto, normalizam o domínio do remetente, aplicam o filtro de ruído e
-// emitem resultados num único canal. A coletora (etapa 3) é a única
-// escritora do estado agregado, portanto nenhum mutex é necessário.
-// ============================================================================
-
-// result is a fully processed job, ready for aggregation.
-// result é um job totalmente processado, pronto para agregação.
-type result struct {
-	domain   string // normalized base domain ("amazon.com")
-	sender   string // original distinct address ("no-reply@amazon.com")
-	category string // matched category name ("verification")
-	subject  string // decoded subject, kept as report sample candidate
-	date     time.Time
-}
-
-// classify returns the first category matching the subject, or "" when none
-// does. Categories are evaluated in priority order (security first), so a
-// subject that matches two patterns keeps its strongest signal.
-//
-// classify retorna a primeira categoria que casa com o assunto, ou "" se
-// nenhuma casar. As categorias são avaliadas em ordem de prioridade
-// (segurança primeiro), então um assunto que case com dois padrões mantém
-// seu sinal mais forte.
-func classify(subject string, cats []Category) string {
-	for _, c := range cats {
-		for _, re := range c.Patterns {
-			if re.MatchString(subject) {
-				return c.Name
-			}
-		}
-	}
-	return ""
-}
-
-// normalizeDomain reduces a mail host to its base service domain:
-// "mail.booking.com" -> "booking.com" only while the leftmost label is a
-// known transactional prefix; unknown subdomains are preserved because we
-// never strip blindly below two labels ("foo.co.uk" stays "foo.co.uk").
-//
-// normalizeDomain reduz um host de e-mail ao domínio base do serviço:
-// "mail.booking.com" -> "booking.com" apenas enquanto o label mais à esquerda
-// for um prefixo transacional conhecido; subdomínios desconhecidos são
-// preservados porque nunca removemos às cegas abaixo de dois labels
-// ("foo.co.uk" continua "foo.co.uk").
-func normalizeDomain(host string) string {
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	labels := strings.Split(host, ".")
-	for len(labels) > 2 && transactionalPrefixes[labels[0]] {
-		labels = labels[1:]
-	}
-	return strings.Join(labels, ".")
-}
-
-// worker consumes jobs until the jobs channel closes. Jobs whose subject
-// matches nothing or whose domain is ignored produce no result — silence is
-// the noise filter at work.
-//
-// worker consome jobs até o canal fechar. Jobs cujo assunto não casa com
-// nada ou cujo domínio está na ignore-list não geram resultado — o silêncio
-// é o filtro de ruído em ação.
-func worker(jobs <-chan job, results chan<- result, cats []Category, ignore map[string]bool) {
-	for j := range jobs {
-		category := classify(j.subject, cats)
-		if category == "" {
-			continue // not an account-evidence email / não evidencia cadastro
-		}
-		domain := normalizeDomain(j.host)
-		if ignore[domain] {
-			continue // configured noise / ruído configurado
-		}
-		results <- result{
-			domain:   domain,
-			sender:   j.from,
-			category: category,
-			subject:  j.subject,
-			date:     j.date,
-		}
-	}
-}
-
-// runWorkerPool spawns cfg.Workers workers and wires the pipeline so that
-// closing jobs automatically drains and closes results. It blocks until all
-// work is done.
-//
-// runWorkerPool cria cfg.Workers workers e conecta o pipeline de modo que
-// fechar jobs drene e feche results automaticamente. Bloqueia até todo o
-// trabalho terminar.
-func runWorkerPool(cfg *Config, cats []Category, jobs <-chan job) <-chan result {
-	results := make(chan result)
-
-	var wg sync.WaitGroup
-	wg.Add(cfg.Workers)
-	for i := 0; i < cfg.Workers; i++ {
-		go func() {
-			defer wg.Done()
-			worker(jobs, results, cats, cfg.Ignore)
-		}()
-	}
-
-	// Single closer goroutine: results stays open until every worker exits,
-	// giving the collector a clean termination signal without mutexes.
-	// Goroutine única que fecha: results fica aberto até todos os workers
-	// terminarem, dando à coletora sinal limpo de término sem mutexes.
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-	return results
-}
-
-// ============================================================================
-// CLASSIFICATION PATTERNS / PADRÕES DE CLASSIFICAÇÃO
-// Subject regexes (case-insensitive) in priority order: the first category
-// that matches a subject wins. Security has top priority.
-// Regexes de assunto (case-insensitive) em ordem de prioridade: a primeira
-// categoria que casa com o assunto vence. Segurança tem prioridade máxima.
-// ============================================================================
-
-// Category is one class of "account evidence" email.
-// Category é uma classe de e-mail que evidencia cadastro em um serviço.
-type Category struct {
-	Name     string           // stable identifier used in reports
-	Priority int              // lower = evaluated first
-	Patterns []*regexp.Regexp // compiled case-insensitive patterns
-}
-
-// categorySpecs maps category names to their PT-BR/EN patterns.
-// categorySpecs mapeia nomes de categoria aos padrões PT-BR/EN.
-var categorySpecs = []struct {
-	Name     string
-	Priority int
-	Patterns []string
-}{
-	{
-		Name: "security", Priority: 1,
-		Patterns: []string{
-			`new login`,
-			`login from`,
-			`new device`,
-			`senha alterada`,
-			`seguran[çc]a atualizad`,
-			`password (was )?changed`,
-		},
-	},
-	{
-		Name: "verification", Priority: 2,
-		Patterns: []string{
-			`verify your email`,
-			`confirme seu e-?mail`,
-			`c[óo]digo de verifica[çc][ãa]o`,
-			`ative sua conta`,
-			`confirm your (email|account)`,
-		},
-	},
-	{
-		Name: "welcome", Priority: 3,
-		Patterns: []string{
-			`welcome to`,
-			`bem-vindo ao?s?`,
-			`obrigado por se registrar`,
-			`sua conta foi criada`,
-		},
-	},
-	{
-		Name: "receipt", Priority: 4,
-		Patterns: []string{
-			`fatura (est[áa] )?dispon[íi]vel`,
-			`pagamento aprovado`,
-			`pedido recebido`,
-			`recibo`,
-		},
-	},
-	{
-		Name: "policy", Priority: 5,
-		Patterns: []string{
-			`privacy policy update`,
-			`termos de uso atualizados`,
-			`terms of (service|use) (update|updated)`,
-		},
-	},
-}
-
-// buildCategories compiles all specs once at startup; workers only read it.
-// buildCategories compila todas as especificações uma vez no startup;
-// os workers apenas a leem.
-func buildCategories() []Category {
-	cats := make([]Category, 0, len(categorySpecs))
-	for _, spec := range categorySpecs {
-		c := Category{Name: spec.Name, Priority: spec.Priority}
-		for _, p := range spec.Patterns {
-			re, err := regexp.Compile(`(?i)` + p)
-			if err != nil {
-				// A bad pattern here is a programming bug, not user input.
-				panic(fmt.Sprintf("invalid category pattern %q: %v", p, err))
-			}
-			c.Patterns = append(c.Patterns, re)
-		}
-		cats = append(cats, c)
-	}
-	// Enforce evaluation order security > verification > welcome > receipt > policy.
-	// Garante a ordem segurança > verificação > boas-vindas > recibo > política.
-	sort.Slice(cats, func(i, j int) bool { return cats[i].Priority < cats[j].Priority })
-	return cats
-}
-
-// ============================================================================
-// PIPELINE STAGE 3 — COLLECTOR / ETAPA 3 DO PIPELINE — COLETORA
-// A single goroutine owns the aggregate map, so workers never touch shared
-// state and the code needs no mutex at all.
-//
-// Uma única goroutine é dona do mapa agregado; assim os workers nunca
-// tocaram em estado compartilhado e o código dispensa qualquer mutex.
-// ============================================================================
-
-// domainStat is one row of the final report: the "birth certificate" of an
-// account at a service plus everything observed about it.
-//
-// domainStat é uma linha do relatório final: a "certidão de nascimento" de
-// uma conta num serviço junto de tudo que foi observado sobre ela.
-type domainStat struct {
-	Domain          string   `json:"domain"`
-	FirstSeen       string   `json:"first_seen,omitempty"` // YYYY-MM-DD or absent when unknown
-	Categories      []string `json:"categories"`
-	Occurrences     int      `json:"occurrences"`
-	SampleSubject   string   `json:"sample_subject"` // prefers verification/welcome samples
-	DistinctSenders int      `json:"distinct_senders"`
-	MultiSender     bool     `json:"multiple_senders_alert"`
-}
-
-// agg is the mutable per-domain accumulator used while streaming results.
-// agg é o acumulador mutável por domínio usado durante o streaming.
-type agg struct {
-	first      time.Time
-	hasDate    bool
-	cats       map[string]bool
-	count      int
-	sample     string
-	sampleRank int // lower = better sample candidate
-	senders    map[string]bool
-}
-
-// categoryRank drives both evaluation order and report display order.
-// categoryRank dirige tanto a ordem de avaliação quanto a de exibição.
-var categoryRank = func() map[string]int {
-	m := make(map[string]int, len(categorySpecs))
-	for _, s := range categorySpecs {
-		m[s.Name] = s.Priority
-	}
-	return m
-}()
-
-// collect consumes every result from the (already concurrent) pipeline and
-// returns report rows sorted by first-seen date ascending — unknown dates go
-// last, keeping the timeline meaningful.
-//
-// collect consome todos os resultados do pipeline (já concorrente) e retorna
-// as linhas do relatório ordenadas por data da primeira ocorrência crescente
-// — datas desconhecidas vão para o fim, preservando a linha do tempo.
-func collect(results <-chan result) []domainStat {
-	aggs := make(map[string]*agg)
-
-	for r := range results {
-		a := aggs[r.domain]
-		if a == nil {
-			a = &agg{
-				cats:       make(map[string]bool),
-				senders:    make(map[string]bool),
-				sampleRank: 1 << 30,
-			}
-			aggs[r.domain] = a
-		}
-
-		a.count++
-		a.cats[r.category] = true
-		a.senders[r.sender] = true
-
-		// Track the earliest envelope Date: the account's "birthday".
-		// Guarda o menor Date do envelope: o "aniversário" da conta.
-		if !r.date.IsZero() && (!a.hasDate || r.date.Before(a.first)) {
-			a.first, a.hasDate = r.date, true
-		}
-
-		// Prefer a subject that screams "account creation": verification
-		// beats welcome beats anything else already stored.
-		// Prefere um assunto que grite "criação de conta": verificação vence
-		// boas-vindas que vence qualquer outro já armazenado.
-		if rank, ok := sampleRank(r.category); ok && rank < a.sampleRank {
-			a.sample, a.sampleRank = r.subject, rank
-		} else if a.sample == "" {
-			a.sample = r.subject
-		}
-	}
-
-	// Materialize rows.
-	// Materializa as linhas.
-	stats := make([]domainStat, 0, len(aggs))
-	for domain, a := range aggs {
-		cats := make([]string, 0, len(a.cats))
-		for c := range a.cats {
-			cats = append(cats, c)
-		}
-		// Categories shown in fixed priority order for stable reports.
-		// Categorias em ordem fixa de prioridade para relatórios estáveis.
-		sort.Slice(cats, func(i, j int) bool {
-			return categoryRank[cats[i]] < categoryRank[cats[j]]
-		})
-
-		row := domainStat{
-			Domain:          domain,
-			Categories:      cats,
-			Occurrences:     a.count,
-			SampleSubject:   a.sample,
-			DistinctSenders: len(a.senders),
-			MultiSender:     len(a.senders) > 1,
-		}
-		if a.hasDate {
-			row.FirstSeen = a.first.Format("2006-01-02")
-		}
-		stats = append(stats, row)
-	}
-
-	sort.Slice(stats, func(i, j int) bool {
-		a, b := stats[i], stats[j]
-		if (a.FirstSeen != "") != (b.FirstSeen != "") {
-			return a.FirstSeen != "" // dated rows first / linhas datadas primeiro
-		}
-		return a.FirstSeen < b.FirstSeen
-	})
-	return stats
-}
-
-// sampleRank maps categories to sample desirability: verification (2) then
-// welcome (3); other categories are not eligible as curated samples but the
-// caller still falls back to the first seen subject.
-//
-// sampleRank mapeia categorias para a preferência de amostra: verificação (2)
-// depois boas-vindas (3); outras categorias não são amostras curadas, mas o
-// chamador ainda usa o primeiro assunto visto como fallback.
-func sampleRank(category string) (int, bool) {
-	switch category {
-	case "verification":
-		return 2, true
-	case "welcome":
-		return 3, true
-	default:
-		return 0, false
-	}
-}
-
-// ============================================================================
-// PIPELINE STAGE 4 — REPORT DISPATCH / ETAPA 4 DO PIPELINE — SAÍDAS
-// The terminal table always renders; -json adds machine output and -html
-// writes a navigable standalone page.
-//
-// A tabela no terminal sempre é exibida; -json acrescenta saída para máquinas
-// e -html grava uma página standalone navegável.
-// ============================================================================
 
 func main() {
 	jsonOut := flag.Bool("json", false, "also print the report as JSON")
@@ -712,40 +166,51 @@ func main() {
 	// credenciais sozinho).
 	cfg, err := bootstrap()
 	if err != nil {
-		printFriendly(err)
+		apperr.PrintFriendly(err)
 		os.Exit(1)
 	}
-	categories := buildCategories()
+	categories := core.BuildCategories()
 
 	// Stage 1: producer goroutine streams header jobs from IMAP.
 	// Etapa 1: goroutine produtora transmite jobs de headers do IMAP.
-	jobs := make(chan job, cfg.BatchSize)
+	jobs := make(chan core.Job, cfg.BatchSize)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(jobs)
-		if err := collectJobs(cfg, jobs); err != nil {
-			errCh <- err
+		client, dialErr := imapx.DialTLS(cfg.Host, cfg.Port)
+		if dialErr != nil {
+			errCh <- apperr.FriendlyDialError(dialErr, cfg.Host+":"+cfg.Port) // translated for non-technical users
+			return
 		}
+		errCh <- imapx.CollectHeaders(client, imapx.Options{
+			User:      cfg.User,
+			Password:  cfg.Password,
+			Mailbox:   cfg.Mailbox,
+			Since:     cfg.Since,
+			BatchSize: cfg.BatchSize,
+		}, jobs)
 	}()
 
 	// Stage 2: worker pool classifies/normalizes/filters concurrently.
 	// Etapa 2: pool de workers classifica/normaliza/filtra em paralelo.
-	results := runWorkerPool(cfg, categories, jobs)
+	results := core.RunWorkerPool(cfg.Workers, categories, cfg.Ignore, jobs)
 
 	// Stage 3+4: single collector aggregates, then the report renders.
 	// Etapas 3+4: coletora única agrega, depois o relatório é impresso.
-	stats := collect(results)
+	stats := core.Collect(results)
 
 	// Collection errors only surface after the drain: any successfully
 	// fetched batches were already processed, so we still show them.
+	// (errCh always receives exactly one value — success or failure.)
 	// Erros de coleta aparecem só após o dreno: lotes já buscados foram
 	// processados, então ainda são exibidos.
+	// (errCh sempre recebe exatamente um valor — sucesso ou falha.)
 	if err := <-errCh; err != nil {
-		printFriendly(err) // bilingual, no stack traces / bilíngue, sem stack trace
+		apperr.PrintFriendly(err) // bilingual, no stack traces / bilíngue, sem stack trace
 		os.Exit(1)
 	}
 
-	renderText(os.Stdout, stats)
+	report.RenderText(os.Stdout, stats)
 	if *jsonOut {
 		out, err := json.MarshalIndent(stats, "", "  ")
 		if err != nil {
@@ -755,49 +220,11 @@ func main() {
 		fmt.Println(string(out))
 	}
 	if *htmlOut {
-		path, err := writeHTMLReport(stats)
+		path, err := report.WriteHTMLReport(stats)
 		if err != nil {
-			printFriendly(err)
+			apperr.PrintFriendly(err)
 			os.Exit(1)
 		}
 		fmt.Printf("\nHTML report: %s\n  PT Abra este arquivo no navegador para uma tabela com busca e ordenação.\n  EN Open this file in your browser for a searchable, sortable table.\n", path)
 	}
-}
-
-// ============================================================================
-// SENDER NORMALIZATION INPUTS / INSUMOS DE NORMALIZAÇÃO DE REMETENTE
-// ============================================================================
-
-// transactionalPrefixes are leftmost DNS labels commonly used by bulk/
-// transactional senders. When stripping from a host we never go below two
-// labels, so "foo.co.uk" stays intact.
-// transactionalPrefixes são labels DNS à esquerda comuns em remetentes
-// transacionais/massivos. Ao remover do host nunca descemos abaixo de dois
-// labels, então "foo.co.uk" permanece intacto.
-var transactionalPrefixes = map[string]bool{
-	"no-reply": true, "noreply": true, "donotreply": true,
-	"mail": true, "email": true, "e": true, "smtp": true,
-	"mkt": true, "marketing": true, "news": true, "newsletter": true,
-	"billing": true, "payments": true, "payment": true, "invoice": true,
-	"notifications": true, "notify": true, "alert": true, "alerts": true,
-	"account": true, "accounts": true, "info": true, "msg": true,
-	"message": true, "messages": true, "bounce": true, "bounces": true,
-}
-
-// defaultIgnoreDomains are excluded from the final report so it stays clean.
-// Extend at runtime with IGNORE_DOMAINS (comma separated).
-// defaultIgnoreDomains são excluídos do relatório final para mantê-lo limpo.
-// Estenda em tempo de execução com IGNORE_DOMAINS (separado por vírgulas).
-var defaultIgnoreDomains = []string{
-	// big techs / big techs
-	"google.com", "youtube.com", "facebook.com", "instagram.com",
-	"whatsapp.com", "linkedin.com", "twitter.com", "x.com",
-	"tiktok.com", "netflix.com", "spotify.com", "amazon.com",
-	"amazon.com.br", "apple.com", "icloud.com", "microsoft.com",
-	"live.com", "office.com", "outlook.com",
-	// monitoring services / serviços de monitoramento
-	"sentry.io", "datadoghq.com", "newrelic.com", "statuspage.io",
-	// known banks (BR) / bancos conhecidos (BR)
-	"nubank.com.br", "itau.com.br", "bradesco.com.br", "bb.com.br",
-	"santander.com.br", "caixa.gov.br",
 }

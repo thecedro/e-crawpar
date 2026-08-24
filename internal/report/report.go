@@ -1,15 +1,12 @@
-package main
-
-// ============================================================================
-// REPORT RENDERING / GERAÇÃO DE RELATÓRIOS
-// renderText produces the terminal table; writeHTMLReport produces a
-// standalone HTML page with client-side search and column sorting. The
-// page has zero external assets, so it works offline and can be shared.
+// Package report renders the final e-crawpar output: a terminal table and a
+// standalone navigable HTML page with client-side search and column sorting.
+// The page has zero external assets, so it works offline and can be shared.
 //
-// renderText produz a tabela no terminal; writeHTMLReport produz uma página
-// HTML standalone com busca e ordenação no navegador. A página não tem
-// nenhum recurso externo: funciona offline e pode ser compartilhada.
-// ============================================================================
+// O pacote report gera a saída final do e-crawpar: uma tabela no terminal e
+// uma página HTML standalone navegável, com busca e ordenação no navegador.
+// A página não tem nenhum recurso externo: funciona offline e pode ser
+// compartilhada.
+package report
 
 import (
 	"embed"
@@ -21,11 +18,19 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"e-crawpar/internal/apperr"
+	"e-crawpar/internal/core"
 )
 
 // --- terminal table / tabela no terminal ---
 
-func renderText(w io.Writer, stats []domainStat) {
+// RenderText writes the terminal table to w. Sample subjects come after the
+// table so long lines never break it.
+//
+// RenderText escreve a tabela do terminal em w. Assuntos exemplo vêm após a
+// tabela para não quebrá-la.
+func RenderText(w io.Writer, stats []core.DomainStat) {
 	tw := tabwriter.NewWriter(w, 2, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "FIRST SEEN\tDOMAIN\tOCCUR\tCATEGORIES\tSENDERS\t")
 	for _, s := range stats {
@@ -43,8 +48,6 @@ func renderText(w io.Writer, stats []domainStat) {
 	}
 	tw.Flush()
 
-	// Sample subjects come after the table so long lines never break it.
-	// Assuntos exemplo vêm após a tabela para não quebrá-la.
 	fmt.Fprintln(w, "\nSample subjects:")
 	for _, s := range stats {
 		fmt.Fprintf(w, "  %s\n    %q\n", s.Domain, s.SampleSubject)
@@ -59,15 +62,26 @@ var reportTemplateFS embed.FS
 
 const htmlReportFile = "e-crawpar-report.html"
 
-// writeHTMLReport renders the navigable report next to the current working
+// WriteHTMLReport renders the navigable report next to the current working
 // directory and returns the absolute path for the user.
 //
-// writeHTMLReport renderiza o relatório navegável na pasta atual e retorna o
+// WriteHTMLReport renderiza o relatório navegável na pasta atual e retorna o
 // caminho absoluto para o usuário.
-func writeHTMLReport(stats []domainStat) (string, error) {
+func WriteHTMLReport(stats []core.DomainStat) (string, error) {
+	return WriteHTMLReportTo("", stats)
+}
+
+// WriteHTMLReportTo renders the navigable report into dir ("" means the
+// current working directory) and returns the absolute file path. The dir
+// parameter exists so tests can write to t.TempDir() instead of the CWD.
+//
+// WriteHTMLReportTo renderiza o relatório navegável em dir ("" significa a
+// pasta atual) e retorna o caminho absoluto. O parâmetro dir existe para que
+// testes gravem em t.TempDir() em vez do diretório corrente.
+func WriteHTMLReportTo(dir string, stats []core.DomainStat) (string, error) {
 	tmplSrc, err := reportTemplateFS.ReadFile("report.html.tmpl")
 	if err != nil {
-		return "", newErrf(
+		return "", apperr.NewErrf(
 			"Arquivo interno do programa faltando.",
 			"Internal program file missing.",
 			"Reinstale o binário a partir de uma release oficial.",
@@ -82,7 +96,7 @@ func writeHTMLReport(stats []domainStat) (string, error) {
 		GeneratedAt      string
 		TotalDomains     int
 		TotalOccurrences int
-		Rows             []domainStat
+		Rows             []core.DomainStat
 	}{
 		GeneratedAt:      time.Now().Format("2006-01-02 15:04"),
 		TotalDomains:     len(stats),
@@ -97,9 +111,10 @@ func writeHTMLReport(stats []domainStat) (string, error) {
 		return "", fmt.Errorf("template parse: %w", err)
 	}
 
-	f, err := os.Create(htmlReportFile) // cwd is predictable for users
+	path := filepath.Join(dir, htmlReportFile)
+	f, err := os.Create(path)
 	if err != nil {
-		return "", newErrf(
+		return "", apperr.NewErrf(
 			"Não consegui criar o arquivo do relatório HTML.",
 			"Could not create the HTML report file.",
 			fmt.Sprintf("Verifique permissões de escrita na pasta atual (%v) ou rode de outra pasta.", err),
@@ -110,9 +125,9 @@ func writeHTMLReport(stats []domainStat) (string, error) {
 	if err := tmpl.Execute(f, data); err != nil {
 		return "", fmt.Errorf("html render: %w", err)
 	}
-	abs, err := filepath.Abs(htmlReportFile)
+	abs, err := filepath.Abs(path)
 	if err != nil {
-		abs = htmlReportFile
+		abs = path
 	}
 	return abs, nil
 }

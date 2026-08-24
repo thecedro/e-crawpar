@@ -21,6 +21,9 @@ import (
 	"strings"
 
 	"golang.org/x/term"
+
+	"e-crawpar/internal/apperr"
+	"e-crawpar/internal/imapx"
 )
 
 const envFile = ".env"
@@ -149,16 +152,16 @@ func promptPassword(r *bufio.Reader, w interface{ Write([]byte) (int, error) }, 
 // probeAccount valida que host+credenciais funcionam via TLS, sem tocar em
 // nada no servidor (select somente-leitura).
 func probeAccount(host, port, user, pass string) error {
-	c, err := dialIMAP(host, port)
+	client, err := imapx.DialTLS(host, port)
 	if err != nil {
 		return err
 	}
-	defer func() { c.Logout().Wait() }()
-	if err := c.Login(user, pass).Wait(); err != nil {
-		return friendlyAuthError(err, user)
+	defer func() { _ = client.Logout() }()
+	if err := client.Login(user, pass); err != nil {
+		return apperr.FriendlyAuthError(err, user)
 	}
-	if _, err := c.Select("INBOX", readOnlySelect).Wait(); err != nil {
-		return friendlySelectError(err, "INBOX")
+	if _, err := client.Select("INBOX", imapx.ReadOnlySelect); err != nil {
+		return apperr.FriendlySelectError(err, "INBOX")
 	}
 	return nil
 }
@@ -188,7 +191,7 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 		}
 	}
 	if idx < 0 {
-		return nil, newErrf("Opção inválida.", "Invalid option.",
+		return nil, apperr.NewErrf("Opção inválida.", "Invalid option.",
 			"Execute novamente e digite o número da opção.", "Run again and type the option number.")
 	}
 	p := providers[idx]
@@ -208,7 +211,7 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 		if err == nil {
 			values["IMAP_APP_PASSWORD"] = pass
 			if werr := writeDotEnv(envFile, values); werr != nil {
-				return nil, newErrf(
+				return nil, apperr.NewErrf(
 					fmt.Sprintf("Conectei, mas não consegui salvar o %s.", envFile),
 					fmt.Sprintf("Connected, but could not save %s.", envFile),
 					fmt.Sprintf("Verifique permissões de escrita na pasta atual (%v).", werr),
@@ -220,7 +223,7 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 			fmt.Fprintln(stdout, "  The file is private (permission 600) and git-ignored.")
 			return values, nil
 		}
-		printFriendly(err)
+		apperr.PrintFriendly(err)
 		if attempt == 3 {
 			break
 		}
@@ -229,7 +232,7 @@ func runSetup(stdin *bufio.Reader, stdout interface{ Write([]byte) (int, error) 
 		pass = promptPassword(stdin, stdout, "Senha de APP:")
 		values["IMAP_USER"] = email
 	}
-	return nil, newErrf(
+	return nil, apperr.NewErrf(
 		"Não conseguimos validar a conexão após 3 tentativas.",
 		"We could not validate the connection after 3 attempts.",
 		"Gere uma NOVA senha de app seguindo o README e execute novamente. Nada foi salvo.",
@@ -253,7 +256,7 @@ func bootstrap() (*Config, error) {
 		return nil, err
 	}
 	if !isInteractive() {
-		return nil, newErrf(
+		return nil, apperr.NewErrf(
 			"Faltam credenciais e não há terminal interativo nesta sessão.",
 			"Credentials are missing and there is no interactive terminal in this session.",
 			"Crie um arquivo "+envFile+" com IMAP_HOST, IMAP_PORT, IMAP_USER e IMAP_APP_PASSWORD (veja o README), ou execute o programa num terminal normal para o modo guiado.",
