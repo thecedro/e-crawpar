@@ -1,0 +1,40 @@
+name: CI
+
+# Every PR and push to main: format check, vet, lint and tests.
+# Todo PR e push na main: checagem de formatação, vet, lint e testes.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # golangci-lint new-from-rev needs history
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt (no diffs allowed)
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::Files not gofmt-formatted:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race -timeout 120s -coverprofile=coverage.txt ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          args: --new-from-rev HEAD~1

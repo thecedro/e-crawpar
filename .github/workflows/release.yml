@@ -1,0 +1,55 @@
+name: Release
+
+# Pushing a tag like v1.2.3 builds binaries for every supported platform
+# and attaches them to the GitHub release.
+#
+# Enviar uma tag como v1.2.3 compila binários para todas as plataformas
+# suportadas e os anexa à release do GitHub.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: .exe }
+          - { goos: darwin,  goarch: amd64, ext: "" }
+          - { goos: darwin,  goarch: arm64, ext: "" } # Apple Silicon
+          - { goos: linux,   goarch: amd64, ext: "" }
+          - { goos: linux,   goarch: arm64, ext: "" } # Raspberry Pi / ARM servers
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags "-s -w" -o "dist/e-crawpar-${GOOS}-${GOARCH}${{ matrix.ext }}" .
+
+      - name: Package (zip for Windows, tar.gz elsewhere)
+        run: |
+          name="e-crawpar-${{ matrix.goos }}-${{ matrix.goarch }}"
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${name}.zip" "${name}.exe"
+          else
+            tar czf "${name}.tar.gz" "${name}"
+          fi
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
