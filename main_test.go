@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -159,5 +161,46 @@ func TestCollectAggregationAndOrdering(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("text report missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestFriendlyErrorClassification ensures common network/IMAP failures map
+// to bilingual user errors instead of raw stack traces.
+//
+// TestFriendlyErrorClassification garante que falhas comuns de rede/IMAP
+// virem erros bilíngues em vez de stack traces brutos.
+func TestFriendlyErrorClassification(t *testing.T) {
+	refused := &net.OpError{Op: "dial", Err: errors.New("connect: connection refused")}
+	dns := &net.DNSError{Err: "no such host", Name: "wrong.host", IsNotFound: true}
+
+	if _, ok := friendlyDialError(refused, "h:1").(*UserError); !ok {
+		t.Error("refused connection should yield a UserError")
+	}
+	ue := friendlyDialError(dns, "wrong.host:993").(*UserError)
+	if !strings.Contains(ue.MsgEN, "not found") {
+		t.Errorf("DNS error misclassified: %q", ue.MsgEN)
+	}
+	if !strings.Contains(ue.HintEN, "imap.gmail.com") {
+		t.Errorf("DNS hint should list provider hosts: %q", ue.HintEN)
+	}
+
+	auth := errors.New("AUTHENTICATIONFAILED: Invalid credentials")
+	ue = friendlyAuthError(auth, "a@b.c").(*UserError)
+	if !strings.Contains(ue.MsgPT, "Login recusado") || !strings.Contains(ue.HintPT, "SENHA DE APP") {
+		t.Errorf("auth error misclassified: %+v", ue)
+	}
+	if strings.Contains(ue.Error(), "a@b.c-password") { // no secrets ever leak
+		t.Error("error message must never contain credentials")
+	}
+
+	badBox := errors.New("EXAMINE: Mailbox doesn't exist")
+	ue = friendlySelectError(badBox, "FOO").(*UserError)
+	if !strings.Contains(ue.MsgEN, "FOO") {
+		t.Errorf("select error should mention mailbox: %q", ue.MsgEN)
+	}
+
+	// Unknown errors still become UserErrors (generic fallback, no panic).
+	if _, ok := friendlyDialError(errors.New("weird"), "h:1").(*UserError); !ok {
+		t.Error("fallback should also be a UserError")
 	}
 }

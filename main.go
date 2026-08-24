@@ -207,19 +207,19 @@ func collectJobs(cfg *Config, jobs chan<- job) error {
 		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
 	})
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", addr, err)
+		return friendlyDialError(err, addr) // translated for non-technical users
 	}
 	defer func() { c.Logout().Wait() }() // best-effort, never masks real errors
 
 	if err := c.Login(cfg.User, cfg.Password).Wait(); err != nil {
-		return fmt.Errorf("login %s: %w", cfg.User, err)
+		return friendlyAuthError(err, cfg.User)
 	}
 
 	// Read-only select (EXAMINE): guarantees no \Seen flag is ever touched.
 	// Select somente-leitura (EXAMINE): garante que nenhuma flag \Seen seja tocada.
 	sel, err := c.Select(cfg.Mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
 	if err != nil {
-		return fmt.Errorf("select %q: %w", cfg.Mailbox, err)
+		return friendlySelectError(err, cfg.Mailbox)
 	}
 	total := sel.NumMessages
 
@@ -734,7 +734,7 @@ func main() {
 	// Erros de coleta aparecem só após o dreno: lotes já buscados foram
 	// processados, então ainda são exibidos.
 	if err := <-errCh; err != nil {
-		fmt.Fprintf(os.Stderr, "collect error: %v\n", err)
+		printFriendly(err) // bilingual, no stack traces / bilíngue, sem stack trace
 		os.Exit(1)
 	}
 
