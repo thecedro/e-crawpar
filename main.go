@@ -50,34 +50,55 @@ type Config struct {
 	Ignore    map[string]bool // normalized domains to skip (built-in + IGNORE_DOMAINS)
 }
 
-// loadConfig reads and validates all environment variables.
-// loadConfig lê e valida todas as variáveis de ambiente.
-func loadConfig() (*Config, error) {
+// loadConfig builds the runtime configuration from a merged view of the
+// .env file and OS environment (OS wins), validating what it can.
+//
+// loadConfig monta a configuração a partir de uma visão mesclada do arquivo
+// .env e do ambiente do SO (o SO vence), validando o que pode.
+func loadConfig(file map[string]string) (*Config, error) {
+	// lookup resolves each key: real environment first, then the .env file.
+	// lookup resolve cada chave: ambiente primeiro, depois o arquivo .env.
+	lookup := func(key string) string {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+		return file[key]
+	}
+
 	cfg := &Config{
-		Host:     os.Getenv("IMAP_HOST"),
-		Port:     envOr("IMAP_PORT", "993"),
-		User:     os.Getenv("IMAP_USER"),
-		Password: os.Getenv("IMAP_APP_PASSWORD"),
-		Mailbox:  envOr("IMAP_MAILBOX", "INBOX"),
+		Host:     lookup("IMAP_HOST"),
+		Port:     lookupOr(lookup, "IMAP_PORT", "993"),
+		User:     lookup("IMAP_USER"),
+		Password: lookup("IMAP_APP_PASSWORD"),
+		Mailbox:  lookupOr(lookup, "IMAP_MAILBOX", "INBOX"),
 	}
 
 	// Mandatory variables: fail fast with a clear message.
 	// Variáveis obrigatórias: falha rápida com mensagem clara.
-	for name, val := range map[string]string{
-		"IMAP_HOST":         cfg.Host,
-		"IMAP_USER":         cfg.User,
-		"IMAP_APP_PASSWORD": cfg.Password,
-	} {
-		if val == "" {
-			return nil, fmt.Errorf("missing required env var %s", name)
+	var missing []string
+	for _, k := range []string{"IMAP_HOST", "IMAP_USER", "IMAP_APP_PASSWORD"} {
+		var val string
+		switch k {
+		case "IMAP_HOST":
+			val = cfg.Host
+		case "IMAP_USER":
+			val = cfg.User
+		case "IMAP_APP_PASSWORD":
+			val = cfg.Password
 		}
+		if val == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, &missingEnvError{Keys: missing}
 	}
 
 	var err error
-	if cfg.Workers, err = envInt("WORKERS", 8); err != nil {
+	if cfg.Workers, err = lookupInt(lookup, "WORKERS", 8); err != nil {
 		return nil, err
 	}
-	if cfg.BatchSize, err = envInt("BATCH_SIZE", 200); err != nil {
+	if cfg.BatchSize, err = lookupInt(lookup, "BATCH_SIZE", 200); err != nil {
 		return nil, err
 	}
 	if cfg.Workers < 1 || cfg.BatchSize < 1 {
@@ -86,7 +107,7 @@ func loadConfig() (*Config, error) {
 
 	// Optional date filter (RFC3339, e.g. 2024-01-01T00:00:00Z).
 	// Filtro opcional por data (RFC3339, ex.: 2024-01-01T00:00:00Z).
-	if raw := os.Getenv("IMAP_SINCE"); raw != "" {
+	if raw := lookup("IMAP_SINCE"); raw != "" {
 		t, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
 			return nil, fmt.Errorf("invalid IMAP_SINCE (want RFC3339): %w", err)
@@ -100,7 +121,7 @@ func loadConfig() (*Config, error) {
 	for _, d := range defaultIgnoreDomains {
 		cfg.Ignore[d] = true
 	}
-	if extra := os.Getenv("IGNORE_DOMAINS"); extra != "" {
+	if extra := lookup("IGNORE_DOMAINS"); extra != "" {
 		for _, d := range strings.Split(extra, ",") {
 			if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
 				cfg.Ignore[d] = true
@@ -111,15 +132,15 @@ func loadConfig() (*Config, error) {
 	return cfg, nil
 }
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+func lookupOr(lookup func(string) string, key, def string) string {
+	if v := lookup(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func envInt(key string, def int) (int, error) {
-	raw := os.Getenv(key)
+func lookupInt(lookup func(string) string, key string, def int) (int, error) {
+	raw := lookup(key)
 	if raw == "" {
 		return def, nil
 	}
@@ -186,6 +207,25 @@ func decodeSubject(s string) string {
 	return s
 }
 
+// readOnlySelect is the only select mode this tool ever uses: the mailbox is
+// opened EXAMINE-style, so no flag (including \Seen) can change.
+//
+// readOnlySelect é o único modo de seleção que a ferramenta usa: a caixa é
+// aberta em estilo EXAMINE, então nenhuma flag (inclusive \Seen) muda.
+var readOnlySelect = &imap.SelectOptions{ReadOnly: true}
+
+// dialIMAP opens the TLS session with sane timeouts. TLS is mandatory:
+// credentials travel inside this session.
+//
+// dialIMAP abre a sessão TLS com timeouts razoáveis. TLS é obrigatório: as
+// credenciais viajam dentro desta sessão.
+func dialIMAP(host, port string) (*imapclient.Client, error) {
+	return imapclient.DialTLS(host+":"+port, &imapclient.Options{
+		TLSConfig: &tls.Config{ServerName: host},
+		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
+	})
+}
+
 // collectJobs runs the whole collection stage: dial, login, select read-only,
 // list target sequence numbers and fetch ENVELOPEs batch by batch, pushing
 // one job per usable message into jobs. Closes nothing — the caller owns the
@@ -196,18 +236,9 @@ func decodeSubject(s string) string {
 // lote a lote, empurrando um job por mensagem útil em jobs. Não fecha nada —
 // o dono do canal é quem chama.
 func collectJobs(cfg *Config, jobs chan<- job) error {
-	addr := cfg.Host + ":" + cfg.Port
-
-	// TLS is mandatory: credentials travel inside this session. A dial
-	// timeout keeps the tool from hanging forever on a dead server.
-	// TLS é obrigatório: as credenciais viajam dentro desta sessão. O timeout
-	// de conexão evita que a ferramenta trave eternamente num servidor morto.
-	c, err := imapclient.DialTLS(addr, &imapclient.Options{
-		TLSConfig: &tls.Config{ServerName: cfg.Host},
-		Dialer:    &net.Dialer{Timeout: 30 * time.Second},
-	})
+	c, err := dialIMAP(cfg.Host, cfg.Port)
 	if err != nil {
-		return friendlyDialError(err, addr) // translated for non-technical users
+		return friendlyDialError(err, cfg.Host+":"+cfg.Port) // translated for non-technical users
 	}
 	defer func() { c.Logout().Wait() }() // best-effort, never masks real errors
 
@@ -217,7 +248,7 @@ func collectJobs(cfg *Config, jobs chan<- job) error {
 
 	// Read-only select (EXAMINE): guarantees no \Seen flag is ever touched.
 	// Select somente-leitura (EXAMINE): garante que nenhuma flag \Seen seja tocada.
-	sel, err := c.Select(cfg.Mailbox, &imap.SelectOptions{ReadOnly: true}).Wait()
+	sel, err := c.Select(cfg.Mailbox, readOnlySelect).Wait()
 	if err != nil {
 		return friendlySelectError(err, cfg.Mailbox)
 	}
@@ -701,11 +732,14 @@ func main() {
 	jsonOut := flag.Bool("json", false, "also print the report as JSON")
 	flag.Parse()
 
-	// Stage 0: load configuration (env vars only, never hardcoded).
-	// Etapa 0: carrega a configuração (só env vars, nunca hardcoded).
-	cfg, err := loadConfig()
+	// Stage 0: bootstrap configuration — .env + OS env, or the interactive
+	// wizard on first run (which validates and saves credentials itself).
+	// Etapa 0: bootstrap da configuração — .env + ambiente do SO, ou o
+	// assistente interativo na primeira execução (que valida e salva as
+	// credenciais sozinho).
+	cfg, err := bootstrap()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
+		printFriendly(err)
 		os.Exit(1)
 	}
 	categories := buildCategories()
