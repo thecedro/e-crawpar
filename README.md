@@ -2,7 +2,7 @@
 
 **Descubra em quais sites e serviços você tem conta — usando só os cabeçalhos dos seus próprios e-mails.**
 
-Você já se perguntou *"em que sites eu me cadrei nesses anos todos?"*. O e-crawpar responde isso varrendo a sua própria caixa de entrada e montando uma lista dos serviços que mandaram boas-vindas, pedidos de verificação, alertas de segurança ou recibos para você.
+Você já se perguntou *"em que sites eu me cadastrei nesses anos todos?"*. O e-crawpar responde isso varrendo a sua própria caixa de entrada e montando uma lista dos serviços que mandaram boas-vindas, pedidos de verificação, alertas de segurança ou recibos para você.
 
 > 🛡️ **Em resumo:** nada sai do seu computador. O programa lê apenas remetente, assunto e data das mensagens — nunca o conteúdo delas — direto do servidor do seu e-mail, por conexão criptografada.
 
@@ -10,13 +10,13 @@ Você já se perguntou *"em que sites eu me cadrei nesses anos todos?"*. O e-cra
 
 ## 🇧🇷 Português
 
-### Como funciona (sem termos técnicos)
+### Como funciona 
 
 Seu e-mail guarda pistas: quando você cria conta num site, quase sempre chega um e-mail tipo *"Bem-vindo!"* ou *"Confirme seu e-mail"*. O e-crawpar procura esses padrões, descobre de qual serviço veio cada um e organiza tudo numa lista com a **data da primeira aparição** — praticamente a *data de nascimento* da sua conta naquele site.
 
 ### Instalação
 
-**Opção A — Baixar pronto (recomendado para quem não programa):**
+**Opção A — Baixar pronto (recomendado):**
 
 1. Abra a aba [Releases](https://github.com/OWNER/e-crawpar/releases) deste repositório *(troque OWNER pelo dono do repo ao publicar)*.
 2. Baixe o arquivo do seu sistema:
@@ -26,13 +26,13 @@ Seu e-mail guarda pistas: quando você cria conta num site, quase sempre chega u
    - Linux: `e-crawpar-linux-amd64.tar.gz` ou `...-arm64.tar.gz`
 3. Extraia o arquivo. Dentro há um programinha chamado `e-crawpar`.
 
-> 💡 No Windows, se aparecer um aviso azul do SmartScreen, clique em **"Mais informações" → "Executar assim mesmo"** — acontece porque o programa não paga certificado digital, não porque haja problema.
+> 💡 No Windows, pode aparecer um aviso do SmartScreen, clique em **"Mais informações" → "Executar assim mesmo"** — acontece devido o programa não estar assinado, não porque haja problema.
 
 **Opção B — Compilar você mesmo:** instale o [Go](https://go.dev/dl/) e rode `go mod tidy && go build`.
 
 ### Antes de usar: crie uma "senha de app"
 
-Programas externos não podem entrar no seu e-mail com a senha normal (isso é bom!). Você precisa criar uma **senha de aplicativo**: uma senha especial, só para este programa, que pode ser revogada quando quiser. Escolha abaixo o passo a passo do seu provedor.
+Programas externos não podem entrar no seu e-mail com a senha normal. Você precisa criar uma **senha de aplicativo**: uma senha especial, só para este programa, que pode ser revogada quando quiser. Escolha abaixo o passo a passo do seu provedor.
 
 #### 📧 Gmail (google.com)
 
