@@ -54,7 +54,7 @@ jobs:
       # Fixado: binários v1.x (default antigo da action) vêm compilados com Go
       # mais velho e geram erros typecheck falsos de "undefined:" com stdlib 1.26.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
           version: v2.13.1
           args: --new-from-rev HEAD~1
