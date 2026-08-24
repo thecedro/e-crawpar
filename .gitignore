@@ -1,0 +1,19 @@
+# Binaries / Binários
+e-crawpar
+e-crawpar.exe
+*.exe
+/dist/
+
+# Local credentials — NEVER commit / Credenciais locais — NUNCA comitar
+.env
+.env.*
+!.env.example
+
+# Generated report / Relatório gerado
+e-crawpar-report.html
+
+# Go toolchain artifacts
+*.test
+*.out
+coverage.txt
+vendor/
