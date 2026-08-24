@@ -37,6 +37,19 @@ func TestClassifyPriority(t *testing.T) {
 		{"Random newsletter content", ""},
 		// multi-match: security beats verification / segurança vence verificação
 		{"New device detected — confirm your account", "security"},
+		// extra PT-BR variants with accents / variações PT-BR com acentos
+		{"Ative sua conta clicando no botão", "verification"},
+		{"Pagamento aprovado para o pedido #99", "receipt"},
+		// extra EN variants / variações EN extras
+		{"Your password was changed successfully", "security"},
+		{"Confirm your email address", "verification"},
+		{"Terms of Service updated", "policy"},
+		// case-insensitivity is mandatory / case-insensitivo é obrigatório
+		{"WELCOME TO OUR SERVICE", "welcome"},
+		{"NEW LOGIN FROM FIREFOX", "security"},
+		// chained multi-match: strongest category must win
+		// casamento múltiplo em cadeia: a categoria mais forte deve vencer
+		{"New login from Chrome — welcome to Acme — privacy policy update", "security"},
 	}
 	for _, tt := range tests {
 		if got := classify(tt.subject, cats); got != tt.want {
@@ -64,6 +77,14 @@ func TestNormalizeDomain(t *testing.T) {
 		{"mail.foo.co.uk", "foo.co.uk"},                      // strip stops at two labels
 		{"email.example.com.br", "example.com.br"},           // known prefix, ccTLD floor respected
 		{"random.sub.example.com", "random.sub.example.com"}, // unknown sub preserved
+		// stacked prefixes are all stripped / prefixos empilhados são removidos
+		{"mail.mail.foo.com", "foo.com"},
+		{"no-reply.billing.example.org", "example.org"},
+		// single-label host passes through untouched / host de um label passa reto
+		{"localhost", "localhost"},
+		// two labels never strip, even when leftmost looks transactional
+		// dois labels nunca removem, mesmo com cara transacional à esquerda
+		{"mail.com", "mail.com"},
 	}
 	for _, tt := range tests {
 		if got := normalizeDomain(tt.host); got != tt.want {
@@ -377,6 +398,91 @@ func TestWriteHTMLReport(t *testing.T) {
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("html missing %q", want)
+		}
+	}
+}
+
+// TestSampleRankPreference locks the curated-sample contract used by the
+// collector: only verification and welcome qualify, verification first.
+//
+// TestSampleRankPreference trava o contrato de amostra curada usado pela
+// coletora: só verificação e boas-vindas qualificam, verificação primeiro.
+func TestSampleRankPreference(t *testing.T) {
+	rankV, okV := sampleRank("verification")
+	rankW, okW := sampleRank("welcome")
+	if !okV || !okW || rankV >= rankW {
+		t.Fatalf("verification must outrank welcome: v=%d(%t) w=%d(%t)", rankV, okV, rankW, okW)
+	}
+	if _, ok := sampleRank("security"); ok {
+		t.Error("security must not be a curated sample")
+	}
+	for _, c := range []string{"receipt", "policy"} {
+		if _, ok := sampleRank(c); ok {
+			t.Errorf("%s must not be a curated sample", c)
+		}
+	}
+}
+
+// TestRunWorkerPoolEndToEnd exercises the real concurrent pipeline with
+// synthetic jobs — many workers, interleaved results, no network involved.
+//
+// TestRunWorkerPoolEndToEnd exercita o pipeline concorrente real com jobs
+// sintéticos — muitos workers, resultados intercalados, sem rede envolvida.
+func TestRunWorkerPoolEndToEnd(t *testing.T) {
+	cfg := &Config{Workers: 8, Ignore: map[string]bool{"netflix.com": true}}
+	jobs := make(chan job)
+
+	const total = 300
+	go func() {
+		defer close(jobs)
+		for i := 0; i < total; i++ {
+			switch i % 3 {
+			case 0: // should survive via mail. prefix strip / sobrevive removendo mail.
+				jobs <- job{subject: "Verify your email", from: "noreply@svc.io",
+					host: "mail.svc.io", date: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)}
+			case 1: // ignored domain noise / ruído de domínio ignorado
+				jobs <- job{subject: "Welcome to Netflix", from: "info@netflix.com",
+					host: "netflix.com", date: time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)}
+			default: // unmatched subject noise / ruído sem categoria
+				jobs <- job{subject: "Weekly digest", from: "news@zine.io",
+					host: "zine.io", date: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)}
+			}
+		}
+	}()
+
+	results := runWorkerPool(cfg, buildCategories(), jobs)
+	stats := collect(results)
+
+	if len(stats) != 1 {
+		t.Fatalf("want exactly 1 surviving domain, got %+v", stats)
+	}
+	s := stats[0]
+	if s.Domain != "svc.io" || s.Occurrences != total/3 {
+		t.Errorf("unexpected aggregate: %+v", s)
+	}
+	if !s.MultiSender { // noreply@svc.io is one distinct sender... single actually
+		if s.DistinctSenders != 1 {
+			t.Errorf("expected single distinct sender, got %d", s.DistinctSenders)
+		}
+	} else {
+		t.Error("single sender must not raise the multi-sender alert")
+	}
+}
+
+// TestCategoryOrderIsStable guarantees report display order follows the spec:
+// security > verification > welcome > receipt > policy.
+//
+// TestCategoryOrderIsStable garante que a ordem de exibição segue a spec:
+// segurança > verificação > boas-vindas > recibo > política.
+func TestCategoryOrderIsStable(t *testing.T) {
+	cats := buildCategories()
+	want := []string{"security", "verification", "welcome", "receipt", "policy"}
+	if len(cats) != len(want) {
+		t.Fatalf("got %d categories, want %d", len(cats), len(want))
+	}
+	for i, c := range cats {
+		if c.Name != want[i] {
+			t.Fatalf("category[%d] = %s, want %s", i, c.Name, want[i])
 		}
 	}
 }
